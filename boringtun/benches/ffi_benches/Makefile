@@ -1,0 +1,28 @@
+SRCDIR := $(dir $(lastword ${MAKEFILE_LIST}))
+PKGDIR := $(realpath ${SRCDIR}/../..)
+OBJDIR := $(shell pwd)
+
+release/libboringtun.a: ${PKGDIR}/Cargo.toml
+	cd ${PKGDIR} && cargo build --lib --release --target-dir ${OBJDIR} --features ffi-bindings
+	echo -n "$@:" > release/libboringtun-fixup.d
+	cat release/libboringtun.d | cut -d: -f2- >> release/libboringtun-fixup.d
+
+-include release/libboringtun-fixup.d
+
+BENCH_CFLAGS := -I ${PKGDIR}/src
+BENCH_SRCS := main.c wg_bench_client.c
+BENCH_OBJS := $(patsubst %.c,%.o,${BENCH_SRCS})
+
+%.o : %.c
+	${CC} ${CFLAGS} ${BENCH_CFLAGS} -c -o $@ $<
+
+ffi-bench: ${BENCH_OBJS} release/libboringtun.a
+	${CC} ${LDLAGS} -o $@ $^
+
+clean:
+	rm -f ${OBJDIR}/*.o
+	rm -rf ${OBJDIR}/release
+	rm -f ${OBJDIR}/ffi-bench
+
+.PHONY: clean
+.DEFAULT_GOAL := ffi-bench
