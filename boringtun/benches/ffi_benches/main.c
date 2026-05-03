@@ -34,47 +34,52 @@ static double timespec_elapsed(const struct timespec *a, const struct timespec* 
 }
 
 static void print_header() {
-    printf("%012s %012s %012s %012s %08s  %-12s\n",
-           "TXPKT", "RXPKT", "TXBYTES", "RXBYTES", "ERRORS", "TRANSFERRED");
+    printf("%012s %012s %08s %08s  %-12s\n",
+           "TXPKT", "RXPKT", "ERRORS", "CPULOAD", "TRANSFERRED");
 }
 
-static void print_stats(const struct wg_bench_statistics* st, double elapsed) {
+static const char* print_bytes(uintmax_t value, char* buffer, size_t bufsize) {
+    const char* suffix = NULL;
+    double vfloat;
+    if (value > 1000000000) {
+        suffix = "GB";
+        vfloat = value / 1000000000.0;
+    } else if (value > 1000000) {
+        suffix = "MB";
+        vfloat = value / 1000000.0;
+    } else if (value > 1000.0) {
+        suffix = "kB";
+        vfloat = value / 1000.0;
+    } else {
+        suffix = "B";
+        vfloat = (double)value;
+    }
+
+    int len = snprintf(buffer, bufsize, "%.3F %s", vfloat, suffix);
+    return buffer;
+}
+
+static void print_stats(const struct wg_bench_statistics* st, double walltime, double cputime) {
     uintmax_t total_errors = 0;
     uintmax_t total_bytes = atomic_load(&st->tx_bytes) + atomic_load(&st->rx_bytes);
     for (int i = 0; i < WG_BENCH_MAX_ERRORS; i++) {
         total_errors += atomic_load(&st->errors[i]);
     }
 
+    char loadbuf[16];
+    snprintf(loadbuf, sizeof(loadbuf), "%.1F%%", 100.0 * cputime / walltime);
+
     // Estimate the total throughput.
     char xfer[32];
-    if (total_bytes > 1000000000) {
-        snprintf(xfer, sizeof(xfer), "%.3F GB", total_bytes / 1000000000.0);
-    } else if (total_bytes > 1000000) {
-        snprintf(xfer, sizeof(xfer), "%.3F MB", total_bytes / 1000000.0);
-    } else if (total_bytes > 1000) {
-        snprintf(xfer, sizeof(xfer), "%.3F kB", total_bytes / 1000.0);
-    } else {
-        snprintf(xfer, sizeof(xfer), "%.3F B", total_bytes);
-    }
-
     char tpbuf[32];
-    double throughput = (double)total_bytes / elapsed;
-    if (throughput > 1000000000) {
-        snprintf(tpbuf, sizeof(tpbuf), "%s (%.3F GB/s)", xfer, throughput / 1000000000.0);
-    } else if (throughput > 1000000) {
-        snprintf(tpbuf, sizeof(tpbuf), "%s (%.3F MB/s)", xfer, throughput / 1000000.0);
-    } else if (throughput > 1000) {
-        snprintf(tpbuf, sizeof(tpbuf), "%s (%.3F kB/s)", xfer, throughput / 1000.0);
-    } else {
-        snprintf(tpbuf, sizeof(tpbuf), "%s (%.3F B/s)", xfer, throughput);
-    }
+    uintmax_t throughput = total_bytes / walltime;
 
     // Prepare the status to write.
     char linebuf[96];
-    int len = snprintf(linebuf, sizeof(linebuf), "\r%12lu %12lu %12lu %12lu %8lu  %-s",
+    int len = snprintf(linebuf, sizeof(linebuf), "\r%12lu %12lu %8lu %08s  %s (%s)",
                        atomic_load(&st->tx_packets), atomic_load(&st->rx_packets),
-                       atomic_load(&st->tx_bytes), atomic_load(&st->rx_bytes),
-                       total_errors, tpbuf);
+                       total_errors, loadbuf, print_bytes(total_bytes, xfer, sizeof(xfer)),
+                       print_bytes(total_bytes / walltime, tpbuf, sizeof(tpbuf)));
 
     struct winsize ws;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
@@ -92,6 +97,42 @@ static void print_stats(const struct wg_bench_statistics* st, double elapsed) {
         linebuf[len] = '\n';
         linebuf[len+1] = '\0';
         puts(linebuf+1);
+    }
+}
+
+static void print_errors(const struct wg_bench_statistics* st) {
+    // From errors.rs
+    const char* names[] = {
+        "DestinationBufferTooSmall",
+        "IncorrectPacketLength",
+        "UnexpectedPacket",
+        "WrongPacketType",
+        "WrongIndex",
+        "WrongKey",
+        "InvalidTai64nTimestamp",
+        "WrongTai64nTimestamp",
+        "InvalidMac",
+        "InvalidAeadTag",
+        "InvalidCounter",
+        "DuplicateCounter",
+        "InvalidPacket",
+        "NoCurrentSession",
+        "LockFailed",
+        "ConnectionExpired",
+        "UnderLoad",
+    };
+    const int maxerr = sizeof(names)/sizeof(char*);
+
+    int maxname = 0;
+    for (int i = 0; i < maxerr; i++) {
+        if (strlen(names[i]) > maxname) {
+            maxname = strlen(names[i]);
+        }
+    }
+
+    printf("\nError Report:\n");
+    for (int i = 0; i < maxerr; i++) {
+        printf("   %*s: %lu\n", maxname, names[i], atomic_load(&st->errors[i]));
     }
 }
 
@@ -162,8 +203,10 @@ int main(int argc, char* argv[]) {
     wg_bench_connect(b, a->pubkey);
 
     struct timespec start;
+    struct timespec cpustart;
     struct timespec end;
     clock_gettime(CLOCK_MONOTONIC, &start);
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpustart);
     end.tv_sec = start.tv_sec + 10;
     end.tv_nsec = start.tv_nsec;
     print_header();
@@ -177,23 +220,29 @@ int main(int argc, char* argv[]) {
         wg_bench_start_send(b);
     }
 
+    struct wg_bench_statistics stats;
     do {
         struct timespec now;
-        struct wg_bench_statistics stats;
+        struct timespec cpu;
         clock_gettime(CLOCK_MONOTONIC, &now);
+        clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu);
 
         // Fetch and render the statistics.
         memset(&stats, 0, sizeof(stats));
         wg_bench_fetch_stats(a, &stats);
         wg_bench_fetch_stats(b, &stats);
-        print_stats(&stats, timespec_elapsed(&now, &start));
+        print_stats(&stats, timespec_elapsed(&now, &start), timespec_elapsed(&cpu, &cpustart));
 
         // Check for the end condition.
         if (end.tv_sec > now.tv_sec) continue;
         if (end.tv_sec < now.tv_sec) break;
         if (end.tv_nsec < now.tv_nsec) break;
     } while(usleep(100000) == 0);
+
     printf("\n");
+    wg_bench_fetch_stats(a, &stats);
+    wg_bench_fetch_stats(b, &stats);
+    print_errors(&stats);
 
     wg_bench_close(a);
     wg_bench_close(b);
