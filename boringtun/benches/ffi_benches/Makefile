@@ -18,11 +18,16 @@ BENCH_CFLAGS := -I ${PKGDIR}/src
 BENCH_SRCS := main.c wg_bench_client.c
 BENCH_OBJS := $(patsubst %.c,%.o,${BENCH_SRCS})
 
+# Profiling support
+BENCH_CFLAGS += -g -fno-omit-frame-pointer
+BENCH_LDFLAGS := -g -fno-omit-frame-pointer
+release/libboringtun.a: export RUSTFLAGS=-C force-frame-pointers=y
+
 %.o : %.c
 	${CC} ${CFLAGS} ${BENCH_CFLAGS} -c -o $@ $<
 
 ffi-bench: ${BENCH_OBJS} release/libboringtun.a
-	${CC} ${LDLAGS} -o $@ $^
+	${CC} ${LDLAGS} ${BENCH_LDFLAGS} -o $@ $^
 
 clean:
 	rm -f ${OBJDIR}/*.o
