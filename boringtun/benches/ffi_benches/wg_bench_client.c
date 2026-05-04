@@ -40,8 +40,8 @@ static void* wg_bench_background(void *arg) {
 
             case WRITE_TO_NETWORK:
                 if (send(client->fd, ciphertext, result.size, MSG_DONTWAIT) < 0) {
+                    atomic_fetch_add(&client->stats.tx_drops, 1);
                     if (errno == EAGAIN) break;
-                    fprintf(stderr, "worker tick write: %s\n", strerror(errno));
                 }
                 break;
 
@@ -92,7 +92,7 @@ static void* wg_bench_send_worker(void *arg) {
 
     // Generate a sample IPv4 packet header.
     memset(ip, 0, sizeof(struct wg_bench_iphdr));
-    ip->vlen = 0x45;
+    ip->vlen = 0x40 + (sizeof(struct wg_bench_iphdr) / 4);
     ip->ttl = 64;
     ip->protocol = IPPROTO_UDP;
     ip->saddr = htonl(src);
@@ -115,7 +115,7 @@ static void* wg_bench_send_worker(void *arg) {
         ip->cksum = 0;
 
         // Encrypt the packet.
-        result = wireguard_write(client->tunnel, plaintext, pktlen, ciphertext, sizeof(ciphertext));
+        result = wireguard_try_write(client->tunnel, plaintext, pktlen, ciphertext, sizeof(ciphertext));
         switch (result.op) {
             case WIREGUARD_DONE:
                 break;
@@ -131,7 +131,8 @@ static void* wg_bench_send_worker(void *arg) {
                 // Not expected in this case.
                 atomic_fetch_add(&client->stats.tx_packets, 1);
                 atomic_fetch_add(&client->stats.tx_bytes, pktlen);
-                if (send(client->fd, ciphertext, result.size, MSG_DONTWAIT) < 0) {
+                if (send(client->fd, ciphertext, result.size, 0) < 0) {
+                    atomic_fetch_add(&client->stats.tx_drops, 1);
                     if (errno == EAGAIN) continue;
                     if (!client->worker_shutdown) {
                         fprintf(stderr, "worker tx error: %s\n", strerror(errno));
@@ -157,7 +158,6 @@ static void* wg_bench_send_worker(void *arg) {
 
 static void* wg_bench_recv_worker(void *arg) {
     struct wg_bench_client *client = (struct wg_bench_client *)arg;
-    struct wireguard_result result;
     uint8_t ciphertext[WG_BENCH_MTU + 32];
     uint8_t plaintext[WG_BENCH_MTU];
 
@@ -177,8 +177,14 @@ static void* wg_bench_recv_worker(void *arg) {
             return NULL;
         }
 
-        // Decrypt the packet.
-        result = wireguard_read(client->tunnel, ciphertext, rx, plaintext, sizeof(plaintext));
+        struct wireguard_result result;
+        if (ciphertext[0] == 0x04) {
+            // Fast path - decrypt data packets without locking.
+            result = wireguard_try_read(client->tunnel, ciphertext, rx, plaintext, sizeof(plaintext));
+        } else {
+            // Slow path - handle handshake and state changes while locking.
+            result = wireguard_read(client->tunnel, ciphertext, rx, plaintext, sizeof(plaintext));
+        }
         switch (result.op) {
             case WIREGUARD_DONE:
                 continue;
@@ -191,7 +197,7 @@ static void* wg_bench_recv_worker(void *arg) {
 
             case WRITE_TO_NETWORK:
                 if (send(client->fd, plaintext, result.size, MSG_DONTWAIT) < 0) {
-                    //fprintf(stderr, "worker reply error: %s\n", strerror(errno));
+                    atomic_fetch_add(&client->stats.tx_drops, 1);
                 }
                 continue;
 
@@ -246,7 +252,7 @@ void wg_bench_start_handshake(struct wg_bench_client* client) {
 
         case WRITE_TO_NETWORK:
             if (send(client->fd, handshake, result.size, MSG_DONTWAIT) < 0) {
-                //fprintf(stderr, "worker reply error: %s\n", strerror(errno));
+                atomic_fetch_add(&client->stats.tx_drops, 1);
             }
             break;
 
@@ -283,6 +289,7 @@ void wg_bench_start_send(struct wg_bench_client* client) {
 
 void wg_bench_fetch_stats(const struct wg_bench_client* client, struct wg_bench_statistics* st) {
     atomic_fetch_add(&st->tx_packets, atomic_load(&client->stats.tx_packets));
+    atomic_fetch_add(&st->tx_drops, atomic_load(&client->stats.tx_drops));
     atomic_fetch_add(&st->tx_bytes, atomic_load(&client->stats.tx_bytes));
     atomic_fetch_add(&st->rx_packets, atomic_load(&client->stats.rx_packets));
     atomic_fetch_add(&st->rx_bytes, atomic_load(&client->stats.rx_bytes));

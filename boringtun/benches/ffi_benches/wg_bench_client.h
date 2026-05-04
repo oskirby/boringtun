@@ -9,6 +9,7 @@
 
 struct wg_bench_statistics {
     atomic_uintmax_t tx_packets;
+    atomic_uintmax_t tx_drops;
     atomic_uintmax_t tx_bytes;
     atomic_uintmax_t rx_packets;
     atomic_uintmax_t rx_bytes;
