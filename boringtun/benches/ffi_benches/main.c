@@ -1,14 +1,18 @@
 
 
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
+#include <limits.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <asm/termbits.h>  /* Definition of TIOC*WINSZ constants */
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <time.h> 
 #include <pthread.h>
 #include <unistd.h>
@@ -16,14 +20,46 @@
 #include "wireguard_ffi.h"
 #include "wg_bench_client.h"
 
+// Exiting because of a signal.
+static int caught_sigint = 0;
+
+static void wg_printf(const char* format, ...) {
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
+        // If on a terminal - clear the line and reset before printing.
+        char fmtbuf[ws.ws_col + strlen(format) + 3];
+        fmtbuf[0] = '\r';
+        memset(&fmtbuf[1], ' ', ws.ws_col);
+        fmtbuf[ws.ws_col+1] = '\r';
+        strcpy(&fmtbuf[2+ws.ws_col], format);
+
+        va_list args;
+        va_start(args, format);
+        vprintf(fmtbuf, args);
+        va_end(args);
+    } else {
+        // Otherwise, just print it.
+        va_list args;
+        va_start(args, format);
+        vprintf(format, args);
+        va_end(args);
+    }
+}
+
+static void wg_print_msg(const char* msg) {
+    wg_printf("%s", msg);
+}
+
 static void handle_signal(int sig) {
     switch (sig) {
         case SIGINT:
-            fprintf(stderr, "benchmark interrupted\n");
+            wg_printf("benchmark interrupted\n");
+            caught_sigint = 1;
             break;
 
         case SIGTERM:
-            fprintf(stderr, "benchmark terminated\n");
+            wg_printf("benchmark terminated\n");
+            caught_sigint = 1;
             break;
     }
 }
@@ -31,11 +67,6 @@ static void handle_signal(int sig) {
 static double timespec_elapsed(const struct timespec *a, const struct timespec* b) {
     double result = (a->tv_sec - b->tv_sec) * 1000000000.0;
     return (double)(result + a->tv_nsec - b->tv_nsec) / 1000000000.0;
-}
-
-static void print_header() {
-    printf("%012s %012s %08s %08s  %-12s\n",
-           "TXPKT", "RXPKT", "ERRORS", "CPULOAD", "TRANSFERRED");
 }
 
 static const char* print_bytes(uintmax_t value, char* buffer, size_t bufsize) {
@@ -75,9 +106,10 @@ static void print_stats(const struct wg_bench_statistics* st, double walltime, d
     uintmax_t throughput = total_bytes / walltime;
 
     // Prepare the status to write.
-    char linebuf[96];
-    int len = snprintf(linebuf, sizeof(linebuf), "\r%12lu %12lu %8lu %08s  %s (%s)",
-                       atomic_load(&st->tx_packets), atomic_load(&st->rx_packets),
+    char linebuf[120];
+    int len = snprintf(linebuf, sizeof(linebuf),
+                       "\r   tx:%-12lu rx:%-12lu drops:%-8lu err:%-8lu load:%08s  %s transferred (%s/s)",
+                       atomic_load(&st->tx_packets), atomic_load(&st->rx_packets), atomic_load(&st->tx_drops),
                        total_errors, loadbuf, print_bytes(total_bytes, xfer, sizeof(xfer)),
                        print_bytes(total_bytes / walltime, tpbuf, sizeof(tpbuf)));
 
@@ -91,7 +123,6 @@ static void print_stats(const struct wg_bench_statistics* st, double walltime, d
             len = sizeof(linebuf);
         }
         write(STDOUT_FILENO, linebuf, len);
-
     } else {
         // Some other file.
         linebuf[len] = '\n';
@@ -130,9 +161,9 @@ static void print_errors(const struct wg_bench_statistics* st) {
         }
     }
 
-    printf("\nError Report:\n");
+    wg_printf("\nError Report:\n");
     for (int i = 0; i < maxerr; i++) {
-        printf("   %*s: %lu\n", maxname, names[i], atomic_load(&st->errors[i]));
+        wg_printf("   %*s: %lu\n", maxname, names[i], atomic_load(&st->errors[i]));
     }
 }
 
@@ -182,6 +213,7 @@ int main(int argc, char* argv[]) {
     }
 
     srand(time(0));
+    set_logging_function(wg_print_msg);
 
     // This thread should handle signals.
     struct sigaction action = {
@@ -209,7 +241,6 @@ int main(int argc, char* argv[]) {
     clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpustart);
     end.tv_sec = start.tv_sec + 10;
     end.tv_nsec = start.tv_nsec;
-    print_header();
 
     // Launch workers.
     wg_bench_start_handshake(a);
@@ -220,10 +251,10 @@ int main(int argc, char* argv[]) {
         wg_bench_start_send(b);
     }
 
+    struct timespec now;
+    struct timespec cpu;
     struct wg_bench_statistics stats;
-    do {
-        struct timespec now;
-        struct timespec cpu;
+    while (!caught_sigint) {
         clock_gettime(CLOCK_MONOTONIC, &now);
         clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu);
 
@@ -234,15 +265,22 @@ int main(int argc, char* argv[]) {
         print_stats(&stats, timespec_elapsed(&now, &start), timespec_elapsed(&cpu, &cpustart));
 
         // Check for the end condition.
-        if (end.tv_sec > now.tv_sec) continue;
-        if (end.tv_sec < now.tv_sec) break;
-        if (end.tv_nsec < now.tv_nsec) break;
-    } while(usleep(100000) == 0);
+        if (end.tv_sec < now.tv_sec) {
+            break;
+        } else if ((end.tv_sec == now.tv_sec) && (end.tv_nsec < now.tv_nsec)) {
+            break;
+        }
 
-    printf("\n");
+        // Sleep for more data.
+        usleep(100000);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu);
     wg_bench_fetch_stats(a, &stats);
     wg_bench_fetch_stats(b, &stats);
     print_errors(&stats);
+    print_stats(&stats, timespec_elapsed(&now, &start), timespec_elapsed(&cpu, &cpustart));
 
     wg_bench_close(a);
     wg_bench_close(b);
