@@ -9,7 +9,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <asm/termbits.h>  /* Definition of TIOC*WINSZ constants */
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -108,7 +107,7 @@ static void print_stats(const struct wg_bench_statistics* st, double walltime, d
     // Prepare the status to write.
     char linebuf[120];
     int len = snprintf(linebuf, sizeof(linebuf),
-                       "\r   tx:%-12lu rx:%-12lu drops:%-8lu err:%-8lu load:%08s  %s transferred (%s/s)",
+                       "\r   tx:%-12lu rx:%-12lu drops:%-8lu err:%-8lu load:%8s  %s transferred (%s/s)",
                        atomic_load(&st->tx_packets), atomic_load(&st->rx_packets), atomic_load(&st->tx_drops),
                        total_errors, loadbuf, print_bytes(total_bytes, xfer, sizeof(xfer)),
                        print_bytes(total_bytes / walltime, tpbuf, sizeof(tpbuf)));
@@ -168,7 +167,7 @@ static void print_errors(const struct wg_bench_statistics* st) {
 }
 
 static void print_usage(FILE* fp, const char* name) {
-    fprintf(fp, "Usage: %s [OPTIONS]\n");
+    fprintf(fp, "Usage: %s [OPTIONS]\n", name);
     fprintf(fp, "Run FFI benchmarks for the boringtun library.\n");
     fprintf(fp, "\n");
     fprintf(fp, "Options:\n");
@@ -275,6 +274,7 @@ int main(int argc, char* argv[]) {
         usleep(100000);
     }
 
+    memset(&stats, 0, sizeof(stats));
     clock_gettime(CLOCK_MONOTONIC, &now);
     clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu);
     wg_bench_fetch_stats(a, &stats);

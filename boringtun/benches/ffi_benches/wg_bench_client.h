@@ -22,8 +22,9 @@ struct wg_bench_client {
     const char *pubkey;
     int fd;
 
+    // The packet send and receive worker pool.
     int       worker_shutdown;
-    pthread_t worker_count;
+    int       worker_count;
     pthread_t workers[WG_BENCH_MAX_THREADS];
 
     // Statistics.

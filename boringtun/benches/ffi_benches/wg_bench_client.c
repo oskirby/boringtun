@@ -128,12 +128,12 @@ static void* wg_bench_send_worker(void *arg) {
                 break;
 
             case WRITE_TO_NETWORK:
-                // Not expected in this case.
                 atomic_fetch_add(&client->stats.tx_packets, 1);
                 atomic_fetch_add(&client->stats.tx_bytes, pktlen);
                 if (send(client->fd, ciphertext, result.size, 0) < 0) {
                     atomic_fetch_add(&client->stats.tx_drops, 1);
                     if (errno == EAGAIN) continue;
+                    if (errno == ENOBUFS) continue;
                     if (!client->worker_shutdown) {
                         fprintf(stderr, "worker tx error: %s\n", strerror(errno));
                     }

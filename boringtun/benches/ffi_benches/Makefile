@@ -1,11 +1,16 @@
 SRCDIR := $(dir $(lastword ${MAKEFILE_LIST}))
 PKGDIR := $(realpath ${SRCDIR}/../..)
 OBJDIR := $(shell pwd)
+HOST_OS := $(shell uname)
+
+ifeq (${HOST_OS},Darwin)
+MACOSX_MAJOR_VERSION := $(shell sw_vers --productVersion | cut -d. -f1)
+export MACOSX_DEPLOYMENT_TARGET=${MACOSX_MAJOR_VERSION}.0
+endif
 
 release/libboringtun.a: ${PKGDIR}/Cargo.toml
 	cd ${PKGDIR} && cargo build --lib --release --target-dir ${OBJDIR} --features ffi-bindings
-	echo -n "$@:" > release/libboringtun-fixup.d
-	cat release/libboringtun.d | cut -d: -f2- >> release/libboringtun-fixup.d
+	@echo "$@: $$(cut -d: -f2- release/libboringtun.d)" > release/libboringtun-fixup.d
 
 -include release/libboringtun-fixup.d
 
