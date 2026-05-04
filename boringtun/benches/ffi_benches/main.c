@@ -60,6 +60,10 @@ static void handle_signal(int sig) {
             wg_printf("benchmark terminated\n");
             caught_sigint = 1;
             break;
+        
+        case SIGHUP:
+            // Do nothing.
+            break;
     }
 }
 
@@ -220,14 +224,11 @@ int main(int argc, char* argv[]) {
     };
     sigaction(SIGINT, &action, NULL);
     sigaction(SIGTERM, &action, NULL);
-
-    // Create a socket pair for the two clients to communicate over.
-    int sv[2];
-    socketpair(AF_UNIX, SOCK_DGRAM, 0, sv);
+    sigaction(SIGHUP, &action, NULL);
 
     // Create two benchmark clients.
-    struct wg_bench_client* a = wg_bench_create(sv[0]);
-    struct wg_bench_client* b = wg_bench_create(sv[1]);
+    struct wg_bench_client* a = wg_bench_create();
+    struct wg_bench_client* b = wg_bench_create();
 
     // Connect the two clients.
     wg_bench_connect(a, b->pubkey);
