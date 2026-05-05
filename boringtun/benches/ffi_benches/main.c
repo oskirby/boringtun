@@ -111,26 +111,17 @@ static void print_stats(const struct wg_bench_statistics* st, double walltime, d
     // Prepare the status to write.
     char linebuf[120];
     int len = snprintf(linebuf, sizeof(linebuf),
-                       "\r   tx:%-12lu rx:%-12lu drops:%-8lu err:%-8lu load:%8s  %s transferred (%s/s)",
+                       "   tx:%-12lu rx:%-12lu drops:%-8lu err:%-8lu load:%8s  %s transferred (%s/s)",
                        atomic_load(&st->tx_packets), atomic_load(&st->rx_packets), atomic_load(&st->tx_drops),
                        total_errors, loadbuf, print_bytes(total_bytes, xfer, sizeof(xfer)),
                        print_bytes(total_bytes / walltime, tpbuf, sizeof(tpbuf)));
-
     struct winsize ws;
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
-        // This is a terminal.
-        if (ws.ws_col < sizeof(linebuf)) {
-            len = ws.ws_col - 1;
-        } else {
-            memset(linebuf + len, ' ', sizeof(linebuf) - len);
-            len = sizeof(linebuf);
-        }
-        write(STDOUT_FILENO, linebuf, len);
+        // If we are on an interactive terminal, refresh the status line
+        dprintf(STDOUT_FILENO, "\r%s%*s\r", linebuf, ws.ws_col - len - 1, "");
     } else {
         // Some other file.
-        linebuf[len] = '\n';
-        linebuf[len+1] = '\0';
-        puts(linebuf+1);
+        printf("%s\n", linebuf);
     }
 }
 
@@ -245,8 +236,8 @@ int main(int argc, char* argv[]) {
     // Launch workers.
     wg_bench_start_handshake(a);
     for (int i = 0; i < num_workers; i++) {
-        wg_bench_start_recv(a);
-        wg_bench_start_recv(b);
+        wg_bench_start_worker(a);
+        wg_bench_start_worker(b);
         wg_bench_start_send(a);
         wg_bench_start_send(b);
     }

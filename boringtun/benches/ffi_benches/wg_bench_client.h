@@ -23,6 +23,7 @@ struct wg_bench_client {
     const char *pubkey;
 
     int                 fd;
+    int                 queue;
     struct sockaddr_un  addr;
     struct sockaddr_un  peer;
 
@@ -41,6 +42,6 @@ struct wg_bench_client* wg_bench_create();
 void wg_bench_connect(struct wg_bench_client* client, const char* pubkey);
 void wg_bench_start_handshake(struct wg_bench_client* client);
 void wg_bench_start_send(struct wg_bench_client* client);
-void wg_bench_start_recv(struct wg_bench_client* client);
+void wg_bench_start_worker(struct wg_bench_client* client);
 void wg_bench_fetch_stats(const struct wg_bench_client* client, struct wg_bench_statistics* stats);
 void wg_bench_close(struct wg_bench_client* client);

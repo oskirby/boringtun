@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,6 +10,13 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+
+#ifdef __linux
+#include <sys/epoll.h>
+#include <sys/timerfd.h>
+#else
+#include <sys/event.h>
+#endif
 
 #define WG_BENCH_MTU 2048
 
@@ -22,64 +30,6 @@ static void wg_worker_sigmask() {
     sigemptyset(&sigset);
     sigaddset(&sigset, SIGHUP);
     pthread_sigmask(SIG_UNBLOCK, &sigset, NULL);
-}
-
-static void* wg_bench_background(void *arg) {
-    struct wg_bench_client *client = (struct wg_bench_client *)arg;
-    struct wireguard_result result;
-    uint8_t ciphertext[WG_BENCH_MTU + 32];
-
-    // Create a separate socket for this thread.
-    int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
-    if (fd < 0) {
-        fprintf(stderr, "background socket error: %s\n", strerror(errno));
-        return NULL;
-    }
-    if (connect(fd, (const struct sockaddr*)&client->peer, sizeof(client->peer)) < 0) {
-        fprintf(stderr, "background connect error: %s\n", strerror(errno));
-        close(fd);
-        return NULL;
-    }
-
-    wg_worker_sigmask();
-    while (true) {
-        if (client->worker_handshake) {
-            client->worker_handshake = false;
-            result = wireguard_force_handshake(client->tunnel, ciphertext, sizeof(ciphertext));
-        } else {
-            result = wireguard_tick(client->tunnel, ciphertext, sizeof(ciphertext));
-        }
-
-        // Process timeouts and state updates.
-        switch (result.op) {
-            case WIREGUARD_DONE:
-                // Sleep for 100ms before trying again.
-                usleep(100000);
-                break;
-
-            case WIREGUARD_ERROR:
-                fprintf(stderr, "worker tick error: %zu\n", result.size);
-                break;
-
-            case WRITE_TO_NETWORK:
-                if (send(fd, ciphertext, result.size, MSG_DONTWAIT) < 0) {
-                    atomic_fetch_add(&client->stats.tx_drops, 1);
-                    if (errno == EAGAIN) break;
-                    fprintf(stderr, "worker tick send: %s\n", strerror(errno));
-                }
-                break;
-
-            case WRITE_TO_TUNNEL_IPV4:
-            case WRITE_TO_TUNNEL_IPV6:
-                // not expected
-                fprintf(stderr, "worker tick tunnel");
-                break;
-            
-            default:
-                fprintf(stderr, "worker tick unknown: %d\n", result.op);
-                break;
-        }
-    }
 }
 
 struct wg_bench_iphdr {
@@ -191,62 +141,144 @@ static void* wg_bench_send_worker(void *arg) {
     return NULL;
 }
 
-static void* wg_bench_recv_worker(void *arg) {
-    struct wg_bench_client *client = (struct wg_bench_client *)arg;
+static void wg_bench_tick(struct wg_bench_client *client) {
     const struct sockaddr* peer = (const struct sockaddr*)&client->peer;
     socklen_t peerlen = sizeof(client->peer);
-    uint8_t ciphertext[WG_BENCH_MTU + 32];
-    uint8_t plaintext[WG_BENCH_MTU];
 
-    wg_worker_sigmask();
-    while (!client->worker_shutdown) {
-        // Read a packet.
-        ssize_t rx = recv(client->fd, ciphertext, sizeof(ciphertext), MSG_DONTWAIT);
-        if (rx == 0) {
-            fprintf(stderr, "worker shutdown\n");
-            return NULL;
-        }
-        if (rx < 0) {
-            if (errno == EAGAIN) continue;
-            if (!client->worker_shutdown) {
-                fprintf(stderr, "worker rx error: %s\n", strerror(errno));
-            }
-            return NULL;
-        }
-
+    while (true) {
+        uint8_t ciphertext[WG_BENCH_MTU + 32];
         struct wireguard_result result;
-        if (ciphertext[0] == 0x04) {
-            // Fast path - decrypt data packets without locking.
-            result = wireguard_try_read(client->tunnel, ciphertext, rx, plaintext, sizeof(plaintext));
-        } else {
-            // Slow path - handle handshake and state changes while locking.
-            result = wireguard_read(client->tunnel, ciphertext, rx, plaintext, sizeof(plaintext));
-        }
+        result = wireguard_tick(client->tunnel, ciphertext, sizeof(ciphertext));
+
+        // Process timeouts and state updates.
         switch (result.op) {
             case WIREGUARD_DONE:
-                continue;
-            
+                return;
+
             case WIREGUARD_ERROR:
-                if (result.size < WG_BENCH_MAX_ERRORS) {
-                    atomic_fetch_add(&client->stats.errors[result.size], 1);
-                }
-                continue;
+                fprintf(stderr, "worker tick error: %zu\n", result.size);
+                return;
 
             case WRITE_TO_NETWORK:
-                if (sendto(client->fd, plaintext, result.size, MSG_DONTWAIT, peer, peerlen) < 0) {
+                if (sendto(client->fd, ciphertext, result.size, MSG_DONTWAIT, peer, sizeof(client->peer)) < 0) {
                     atomic_fetch_add(&client->stats.tx_drops, 1);
                 }
                 continue;
 
             case WRITE_TO_TUNNEL_IPV4:
             case WRITE_TO_TUNNEL_IPV6:
-                atomic_fetch_add(&client->stats.rx_packets, 1);
-                atomic_fetch_add(&client->stats.rx_bytes, result.size);
+                // not expected
+                fprintf(stderr, "worker tick tunnel");
                 break;
-
+            
             default:
-                continue;
+                fprintf(stderr, "worker tick unknown: %d\n", result.op);
+                return;
         }
+    }
+}
+
+static void wg_bench_recv(struct wg_bench_client *client) {
+    uint8_t ciphertext[WG_BENCH_MTU + 32];
+    uint8_t plaintext[WG_BENCH_MTU];
+    struct wireguard_result result;
+
+    const struct sockaddr* peer = (const struct sockaddr*)&client->peer;
+    socklen_t peerlen = sizeof(client->peer);
+
+    // Read a packet.
+    ssize_t rx = recv(client->fd, ciphertext, sizeof(ciphertext), 0);
+    if (rx == 0) {
+        fprintf(stderr, "worker shutdown\n");
+        return;
+    }
+    if (rx < 0) {
+        if (!client->worker_shutdown) {
+            //fprintf(stderr, "worker rx error: %s\n", strerror(errno));
+        }
+        return;
+    }
+
+    if (ciphertext[0] == 0x04) {
+        // Fast path - decrypt data packets without locking.
+        result = wireguard_try_read(client->tunnel, ciphertext, rx, plaintext, sizeof(plaintext));
+    } else {
+        // Slow path - handle handshake and state changes while locking.
+        result = wireguard_read(client->tunnel, ciphertext, rx, plaintext, sizeof(plaintext));
+    }
+
+    switch (result.op) {
+        case WIREGUARD_DONE:
+            break;
+        
+        case WIREGUARD_ERROR:
+            if (result.size < WG_BENCH_MAX_ERRORS) {
+                atomic_fetch_add(&client->stats.errors[result.size], 1);
+            }
+            break;
+
+        case WRITE_TO_NETWORK:
+            // This is not expected, but I guess it's possible
+            if (sendto(client->fd, plaintext, result.size, MSG_DONTWAIT, peer, peerlen) < 0) {
+                atomic_fetch_add(&client->stats.tx_drops, 1);
+            }
+            break;
+
+        case WRITE_TO_TUNNEL_IPV4:
+        case WRITE_TO_TUNNEL_IPV6:
+            atomic_fetch_add(&client->stats.rx_packets, 1);
+            atomic_fetch_add(&client->stats.rx_bytes, result.size);
+            break;
+
+        default:
+            break;
+    }
+}
+
+static void* wg_bench_worker(void *arg) {
+    struct wg_bench_client *client = (struct wg_bench_client *)arg;
+
+    wg_worker_sigmask();
+    while (!client->worker_shutdown) {
+#ifdef __linux
+        // Wait for an event to handle.
+        struct epoll_event ev[16];
+        int maxev = sizeof(ev)/sizeof(struct epoll_event);
+        int nev = epoll_wait(client->queue, ev, maxev, -1);
+        if (nfds == -1) {
+            if (errno == EINTR) continue;
+            fprintf(stderr, "worker epoll error: %s\n", strerror(errno));
+            continue;
+        }
+    
+        // Handle events.
+        for (int i = 0; i < nev; i++) {
+            if (ev[i].data.fd < 0) {
+                wg_bench_tick(client);
+            } else if (ev[i].data.fd == client->fd) {
+                wg_bench_recv(client);
+            }
+        }
+#else
+        // Wait for an event to handle.
+        struct kevent kev[16];
+        int maxev = sizeof(kev)/sizeof(struct kevent);
+        int nev = kevent(client->queue, NULL, 0, kev, maxev, NULL);
+        if (nev < 0) {
+            if (errno == EINTR) continue;
+            fprintf(stderr, "worker kevent error: %s\n", strerror(errno));
+            continue;
+        }
+
+        // Handle events.
+        for (int i = 0; i < nev; i++) {
+            if (kev[i].filter == EVFILT_TIMER) {
+                wg_bench_tick(client);
+            } else if (kev[i].filter == EVFILT_READ) {
+                wg_bench_recv(client);
+            }
+        }
+#endif
     }
 
     return NULL;
@@ -298,6 +330,12 @@ struct wg_bench_client* wg_bench_create() {
         return NULL;
     }
 
+    fcntl(client->fd, F_SETFL, fcntl(client->fd, F_GETFL) | O_NONBLOCK);
+#ifdef __linux
+    client->queue = epoll_create1(0);
+#else
+    client->queue = kqueue();
+#endif
     return client;
 }
 
@@ -308,20 +346,72 @@ void wg_bench_connect(struct wg_bench_client* client, const char* pubkey) {
 
     wg_bench_sockaddr(pubkey, &client->peer);
 
-    // Start the background worker to drive wireguard_tick();
-    pthread_create(&client->background, NULL, wg_bench_background, client);
+    // Begin packet processing.
+#ifdef __linux
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.fd = client->fd;
+    epoll_ctl(client->queue, EPOLL_CTL_ADD, client->fd, &ev);
+
+    int timer = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+    ev.events = EPOLLIN;
+    ev.data.fd = -1;
+    epoll_ctl(client->queue, EPOLL_CTL_ADD, timer, &ev);
+
+    struct itimerspec itspec;
+    itspec.it_value.tv_sec = 0;
+    itspec.it_value.tv_nsec = 100000000;
+    itspec.it_interval.tv_sec = 0;
+    itspec.it_interval.tv_nsec = 100000000;
+    timerfd_settime(timer, 0, &itspec, NULL);
+#else
+    struct kevent kev[2];
+    EV_SET(&kev[0], client->fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+    EV_SET(&kev[1], 1, EVFILT_TIMER, EV_ADD, 0, 100, NULL);
+    kevent(client->queue, kev, 2, NULL, 0, NULL);
+#endif
 }
 
 void wg_bench_start_handshake(struct wg_bench_client* client) {
-    client->worker_handshake = true;
-    pthread_kill(client->background, SIGHUP);
+    uint8_t ciphertext[WG_BENCH_MTU + 32];
+    struct wireguard_result result;
+    result = wireguard_force_handshake(client->tunnel, ciphertext, sizeof(ciphertext));
+
+    const struct sockaddr* peer = (const struct sockaddr*)&client->peer;
+    socklen_t peerlen = sizeof(client->peer);
+
+    // Process timeouts and state updates.
+    switch (result.op) {
+        case WIREGUARD_DONE:
+            break;
+
+        case WIREGUARD_ERROR:
+            fprintf(stderr, "worker handshake error: %zu\n", result.size);
+            break;
+
+        case WRITE_TO_NETWORK:
+            if (sendto(client->fd, ciphertext, result.size, MSG_DONTWAIT, peer, sizeof(client->peer)) < 0) {
+                atomic_fetch_add(&client->stats.tx_drops, 1);
+            }
+            break;
+
+        case WRITE_TO_TUNNEL_IPV4:
+        case WRITE_TO_TUNNEL_IPV6:
+            // not expected
+            fprintf(stderr, "worker handshake tunnel");
+            break;
+        
+        default:
+            fprintf(stderr, "worker handshake unknown: %d\n", result.op);
+            return;
+    }
 }
 
-void wg_bench_start_recv(struct wg_bench_client* client) {
+void wg_bench_start_worker(struct wg_bench_client* client) {
     if (client->worker_count >= WG_BENCH_MAX_THREADS) {
         return;
     }
-    if (pthread_create(&client->workers[client->worker_count], NULL, wg_bench_recv_worker, client) != 0) {
+    if (pthread_create(&client->workers[client->worker_count], NULL, wg_bench_worker, client) != 0) {
         return;
     }
     client->worker_count++;
@@ -351,16 +441,15 @@ void wg_bench_fetch_stats(const struct wg_bench_client* client, struct wg_bench_
 void wg_bench_close(struct wg_bench_client* client) {
     // Signal that we are shutting down and terminate workers.
     client->worker_shutdown = 1;
-    pthread_cancel(client->background);
-    pthread_kill(client->background, SIGHUP);
-    pthread_join(client->background, NULL);
     for (int i = 0; i < client->worker_count; i++) {
         pthread_cancel(client->workers[i]);
         pthread_kill(client->workers[i], SIGHUP);
         pthread_join(client->workers[i], NULL);
     }
+    close(client->queue);
 
     shutdown(client->fd, SHUT_RDWR);
+    unlink(client->addr.sun_path);
     close(client->fd);
 
     x25519_key_to_str_free(client->pubkey);
