@@ -11,7 +11,7 @@ use crate::x25519::{PublicKey, StaticSecret};
 use base64::{decode, encode};
 use hex::encode as encode_hex;
 use libc::{raise, SIGSEGV};
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use rand_core::OsRng;
 use tracing;
 use tracing_subscriber::fmt;
@@ -364,15 +364,17 @@ pub unsafe extern "C" fn wireguard_read(
     // Slices are not owned, and therefore will not be freed by Rust
     let src = slice::from_raw_parts(src, src_size as usize);
     let dst = slice::from_raw_parts_mut(dst, dst_size as usize);
-    let packet_type = src.first_chunk::<4>().map(|x| u32::from_le_bytes(*x));
 
-    // Data packets can be handled while holding a read lock.
-    if packet_type == Some(super::noise::DATA) {
-        let rotunnel = tunnel.as_ref().unwrap().read();
-        return wireguard_result::from(rotunnel.try_decapsulate(src, dst));
+    // Try handling the packet with a read lock, this is the common case
+    // where we are processing data packets and doing rate limit checks.
+    let tunnel = tunnel.as_ref().unwrap().upgradable_read();
+    if let Some(result) = tunnel.try_decapsulate(None, src, dst) {
+        return wireguard_result::from(result);
     }
 
-    let mut tunnel = tunnel.as_ref().unwrap().write();
+    // Otherwise, whatever this packet is - we will need a write lock to
+    // process it. This is likely a verified handshake packet of some sort.
+    let mut tunnel = RwLockUpgradableReadGuard::upgrade(tunnel);
     wireguard_result::from(tunnel.decapsulate(None, src, dst))
 }
 

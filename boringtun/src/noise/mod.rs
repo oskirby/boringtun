@@ -75,10 +75,10 @@ pub struct Tunn {
 }
 
 type MessageType = u32;
-pub const HANDSHAKE_INIT: MessageType = 1;
-pub const HANDSHAKE_RESP: MessageType = 2;
-pub const COOKIE_REPLY: MessageType = 3;
-pub const DATA: MessageType = 4;
+const HANDSHAKE_INIT: MessageType = 1;
+const HANDSHAKE_RESP: MessageType = 2;
+const COOKIE_REPLY: MessageType = 3;
+const DATA: MessageType = 4;
 
 const HANDSHAKE_INIT_SZ: usize = 148;
 const HANDSHAKE_RESP_SZ: usize = 92;
@@ -322,27 +322,32 @@ impl Tunn {
     /// Receives a UDP datagram from the network and parses it.
     /// Returns TunnResult.
     ///
-    /// This is a subset of decapsulate that only accepts PacketData, but can be called without needing
-    /// to acquire a write lock on the tunnel state. Callers should verify the packet type before calling
-    /// this method.
+    /// This is a subset of decapsulate that operates on a non-mutable tunnel.
+    /// Will return Some(TunnResult) if the packet was handled successfully, or
+    /// None if processing requires a mutable tunnel.
+    ///
+    /// This method can handle the common case of data packet decryption and
+    /// cookie verification while permitting multithreaded access to the tunnel.
     pub fn try_decapsulate<'a>(
         &self,
+        src_addr: Option<IpAddr>,
         datagram: &[u8],
         dst: &'a mut [u8],
-    ) -> TunnResult<'a> {
-        // Dequeueing not supported, caller should use decapsulate() instead.
+    ) -> Option<TunnResult<'a>> {
+        // Packet dequeue operations require a write lock.
         if datagram.is_empty() {
-            return TunnResult::Done;
+            return if self.packet_queue.is_empty() { Some(TunnResult::Done) } else { None };
         }
 
-        // Handle the packet if, and only if, it's a data packet.
-        if let Ok(packet) = Tunn::parse_incoming_packet(datagram) {
-            match packet {
-                Packet::PacketData(p) => self.handle_data(p, dst).unwrap_or_else(TunnResult::from),
-                _ => TunnResult::Done
+        let mut cookie = [0u8; COOKIE_REPLY_SZ];
+        match self.rate_limiter.verify_packet(src_addr, datagram, &mut cookie) {
+            Ok(Packet::PacketData(p)) => Some(self.handle_data(p, dst).unwrap_or_else(TunnResult::from)),
+            Err(TunnResult::WriteToNetwork(cookie)) => {
+                dst[..cookie.len()].copy_from_slice(cookie);
+                return Some(TunnResult::WriteToNetwork(&mut dst[..cookie.len()]));
             }
-        } else {
-            TunnResult::Done
+            Err(TunnResult::Err(e)) => return Some(TunnResult::Err(e)),
+            _ => None
         }
     }
 
