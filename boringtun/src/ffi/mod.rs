@@ -361,28 +361,19 @@ pub unsafe extern "C" fn wireguard_read(
     dst: *mut u8,
     dst_size: u32,
 ) -> wireguard_result {
-    let mut tunnel = tunnel.as_ref().unwrap().write();
     // Slices are not owned, and therefore will not be freed by Rust
     let src = slice::from_raw_parts(src, src_size as usize);
     let dst = slice::from_raw_parts_mut(dst, dst_size as usize);
-    wireguard_result::from(tunnel.decapsulate(None, src, dst))
-}
+    let packet_type = src.first_chunk::<4>().map(|x| u32::from_le_bytes(*x));
 
-/// Read a UDP packet from the server.
-/// For more details check noise::network_to_tunnel functions.
-#[no_mangle]
-pub unsafe extern "C" fn wireguard_try_read(
-    tunnel: *const RwLock<Tunn>,
-    src: *const u8,
-    src_size: u32,
-    dst: *mut u8,
-    dst_size: u32,
-) -> wireguard_result {
-    let tunnel = tunnel.as_ref().unwrap().read();
-    // Slices are not owned, and therefore will not be freed by Rust
-    let src = slice::from_raw_parts(src, src_size as usize);
-    let dst = slice::from_raw_parts_mut(dst, dst_size as usize);
-    wireguard_result::from(tunnel.try_decapsulate(src, dst))
+    // Data packets can be handled while holding a read lock.
+    if packet_type == Some(super::noise::DATA) {
+        let rotunnel = tunnel.as_ref().unwrap().read();
+        return wireguard_result::from(rotunnel.try_decapsulate(src, dst));
+    }
+
+    let mut tunnel = tunnel.as_ref().unwrap().write();
+    wireguard_result::from(tunnel.decapsulate(None, src, dst))
 }
 
 /// This is a state keeping function, that need to be called periodically.

@@ -75,10 +75,10 @@ pub struct Tunn {
 }
 
 type MessageType = u32;
-const HANDSHAKE_INIT: MessageType = 1;
-const HANDSHAKE_RESP: MessageType = 2;
-const COOKIE_REPLY: MessageType = 3;
-const DATA: MessageType = 4;
+pub const HANDSHAKE_INIT: MessageType = 1;
+pub const HANDSHAKE_RESP: MessageType = 2;
+pub const COOKIE_REPLY: MessageType = 3;
+pub const DATA: MessageType = 4;
 
 const HANDSHAKE_INIT_SZ: usize = 148;
 const HANDSHAKE_RESP_SZ: usize = 92;

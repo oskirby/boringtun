@@ -199,14 +199,7 @@ static void wg_bench_recv(struct wg_bench_client *client) {
         return;
     }
 
-    if (ciphertext[0] == 0x04) {
-        // Fast path - decrypt data packets without locking.
-        result = wireguard_try_read(client->tunnel, ciphertext, rx, plaintext, sizeof(plaintext));
-    } else {
-        // Slow path - handle handshake and state changes while locking.
-        result = wireguard_read(client->tunnel, ciphertext, rx, plaintext, sizeof(plaintext));
-    }
-
+    result = wireguard_read(client->tunnel, ciphertext, rx, plaintext, sizeof(plaintext));
     switch (result.op) {
         case WIREGUARD_DONE:
             break;
