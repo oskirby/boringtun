@@ -367,14 +367,16 @@ pub unsafe extern "C" fn wireguard_read(
 
     // Try handling the packet with a read lock, this is the common case
     // where we are processing data packets and doing rate limit checks.
-    let tunnel = tunnel.as_ref().unwrap().upgradable_read();
-    if let Some(result) = tunnel.try_decapsulate(None, src, dst) {
-        return wireguard_result::from(result);
+    {
+        let rotunnel = tunnel.as_ref().unwrap().read();
+        if let Some(result) = rotunnel.try_decapsulate(None, src, dst) {
+            return wireguard_result::from(result);
+        }
     }
 
     // Otherwise, whatever this packet is - we will need a write lock to
     // process it. This is likely a verified handshake packet of some sort.
-    let mut tunnel = RwLockUpgradableReadGuard::upgrade(tunnel);
+    let mut tunnel = tunnel.as_ref().unwrap().write();
     wireguard_result::from(tunnel.decapsulate(None, src, dst))
 }
 
