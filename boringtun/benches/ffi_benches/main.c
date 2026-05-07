@@ -65,6 +65,13 @@ static void handle_signal(int sig) {
     }
 }
 
+static long timespec_cmp(const struct timespec *a, const struct timespec* b) {
+    if (long i = (a->tv_sec - b->tv_sec)) {
+        return i;
+    }
+    return (a->tv_nsec - b->tv_nsec);
+}
+
 static double timespec_elapsed(const struct timespec *a, const struct timespec* b) {
     double result = (a->tv_sec - b->tv_sec) * 1000000000.0;
     return (double)(result + a->tv_nsec - b->tv_nsec) / 1000000000.0;
@@ -164,18 +171,21 @@ static void print_usage(FILE* fp, const char* name) {
     fprintf(fp, "Run FFI benchmarks for the boringtun library.\n");
     fprintf(fp, "\n");
     fprintf(fp, "Options:\n");
+    fprintf(fp, "\t--time, -t DUR   run benchmark for DUR seconds\n");
     fprintf(fp, "\t--jobs, -j NUM   create NUM parallel threads\n");
     fprintf(fp, "\t--help, -h       display this message and exit\n");
 }
 
 int main(int argc, char* argv[]) {
-    const char* shortopts = "hj:";
+    const char* shortopts = "t:j:h";
     const struct option longopts[] = {
-        {"help", no_argument,       0, 'h'},
+        {"time", required_argument, 0, 't'},
         {"jobs", required_argument, 0, 'j'},
+        {"help", no_argument,       0, 'h'},
         {NULL, 0, 0, 0}
     };
     unsigned int num_workers = 1;
+    unsigned int duration = 10;
 
     // Parse options
     while (true) {
@@ -187,6 +197,14 @@ int main(int argc, char* argv[]) {
 
         char* endp;
         switch (opt) {
+            case 't':
+                duration = strtoul(optarg, &endp, 10);
+                if (*endp != '\0' || (duration == 0)) {
+                    fprintf(stderr, "Invalid duration: %s\n", optarg);
+                    return 1;
+                }
+                break;
+
             case 'j':
                 num_workers = strtoul(optarg, &endp, 10);
                 if (*endp != '\0' || (num_workers == 0)) {
@@ -226,10 +244,13 @@ int main(int argc, char* argv[]) {
     struct timespec start;
     struct timespec cpustart;
     struct timespec end;
+    struct timespec renegotiate;
     clock_gettime(CLOCK_MONOTONIC, &start);
     clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpustart);
-    end.tv_sec = start.tv_sec + 10;
+    end.tv_sec = start.tv_sec + duration;
     end.tv_nsec = start.tv_nsec;
+    renegotiate.tv_sec = start.tv_sec + 1;
+    renegotiate.tv_nsec = start.tv_nsec;
 
     // Launch workers.
     wg_bench_start_handshake(a);
@@ -252,10 +273,12 @@ int main(int argc, char* argv[]) {
         print_stats(&stats, timespec_elapsed(&now, &start), timespec_elapsed(&cpu, &cpustart));
 
         // Check for the end condition.
-        if (end.tv_sec < now.tv_sec) {
+        if (timespec_cmp(&end, &now) < 0) {
             break;
-        } else if ((end.tv_sec == now.tv_sec) && (end.tv_nsec < now.tv_nsec)) {
-            break;
+        }
+        if (timespec_cmp(&renegotiate, &now) < 0) {
+            renegotiate.tv_sec++;
+            wg_bench_start_handshake(a);
         }
 
         // Sleep for more data.
