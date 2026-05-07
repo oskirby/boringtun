@@ -2,7 +2,6 @@
 
 #include <pthread.h>
 #include <stdatomic.h>
-#include <sys/un.h>
 #include "wireguard_ffi.h"
 
 #define WG_BENCH_MAX_THREADS 256
@@ -22,10 +21,7 @@ struct wg_bench_client {
     struct x25519_key secret;
     const char *pubkey;
 
-    int                 fd;
-    int                 queue;
-    struct sockaddr_un  addr;
-    struct sockaddr_un  peer;
+    struct wg_bench_client* peer;
 
     // The packet send and receive worker pool.
     int       worker_handshake;
@@ -39,7 +35,7 @@ struct wg_bench_client {
 };
 
 struct wg_bench_client* wg_bench_create();
-void wg_bench_connect(struct wg_bench_client* client, const char* pubkey);
+void wg_bench_connect(struct wg_bench_client* client, struct wg_bench_client* peer);
 void wg_bench_start_handshake(struct wg_bench_client* client);
 void wg_bench_start_send(struct wg_bench_client* client);
 void wg_bench_start_worker(struct wg_bench_client* client);

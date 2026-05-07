@@ -1,7 +1,6 @@
 
 
 #include <errno.h>
-#include <fcntl.h>
 #include <getopt.h>
 #include <limits.h>
 #include <signal.h>
@@ -10,7 +9,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
-#include <sys/socket.h>
 #include <sys/time.h>
 #include <time.h> 
 #include <pthread.h>
@@ -222,8 +220,8 @@ int main(int argc, char* argv[]) {
     struct wg_bench_client* b = wg_bench_create();
 
     // Connect the two clients.
-    wg_bench_connect(a, b->pubkey);
-    wg_bench_connect(b, a->pubkey);
+    wg_bench_connect(a, b);
+    wg_bench_connect(b, a);
 
     struct timespec start;
     struct timespec cpustart;
@@ -238,8 +236,6 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < num_workers; i++) {
         wg_bench_start_worker(a);
         wg_bench_start_worker(b);
-        wg_bench_start_send(a);
-        wg_bench_start_send(b);
     }
 
     struct timespec now;
@@ -273,6 +269,7 @@ int main(int argc, char* argv[]) {
     wg_bench_fetch_stats(b, &stats);
     print_errors(&stats);
     print_stats(&stats, timespec_elapsed(&now, &start), timespec_elapsed(&cpu, &cpustart));
+    printf("\n");
 
     wg_bench_close(a);
     wg_bench_close(b);
