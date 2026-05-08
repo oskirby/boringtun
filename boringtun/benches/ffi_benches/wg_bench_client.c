@@ -58,7 +58,6 @@ static void wg_bench_input_packet(struct wg_bench_client *client, const void *da
             break;
 
         case WRITE_TO_NETWORK:
-            // This is not expected, but I guess it's possible
             return wg_bench_input_packet(client->peer, plaintext, result.size);
 
         case WRITE_TO_TUNNEL_IPV4:
@@ -106,8 +105,8 @@ static void* wg_bench_worker(void *arg) {
         ip->cksum = 0;
 
         // Encrypt the packet.
-        result = wireguard_try_write(client->tunnel, plaintext, pktlen,
-                                     ciphertext, sizeof(ciphertext));
+        result = wireguard_write(client->tunnel, plaintext, pktlen,
+                                 ciphertext, sizeof(ciphertext));
         switch (result.op) {
             case WIREGUARD_DONE:
                 break;

@@ -89,12 +89,6 @@ struct wireguard_result wireguard_write(const struct wireguard_tunnel *tunnel,
                                         uint8_t *dst,
                                         uint32_t dst_size);
 
-struct wireguard_result wireguard_try_write(const struct wireguard_tunnel *tunnel,
-                                            const uint8_t *src,
-                                            uint32_t src_size,
-                                            uint8_t *dst,
-                                            uint32_t dst_size);
-
 struct wireguard_result wireguard_read(const struct wireguard_tunnel *tunnel,
                                        const uint8_t *src,
                                        uint32_t src_size,

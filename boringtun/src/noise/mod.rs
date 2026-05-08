@@ -268,6 +268,13 @@ impl Tunn {
         return self.format_handshake_initiation(dst, false);
     }
 
+    /// Encapsulate a single packet from the tunnel interface.
+    /// Returns TunnResult::WriteToNetwork if there is a valid session, or
+    /// TunnResult::Done if the packet could not be handled yet.
+    ///
+    /// # Panics
+    /// Panics if dst buffer is too small.
+    /// Size of dst should be at least src.len() + 32, and no less than 148 bytes.
     pub fn try_encapsulate<'a>(&self, src: &[u8], dst: &'a mut [u8]) -> TunnResult<'a> {
         let current = self.current.load(Ordering::Relaxed);
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
@@ -322,12 +329,12 @@ impl Tunn {
     /// Receives a UDP datagram from the network and parses it.
     /// Returns TunnResult.
     ///
-    /// This is a subset of decapsulate that operates on a non-mutable tunnel.
+    /// This is a subset of decapsulate that operates on a read only tunnel.
     /// Will return Some(TunnResult) if the packet was handled successfully, or
-    /// None if processing requires a mutable tunnel.
+    /// None if processing requires a mutable reference to the tunnel.
     ///
     /// This method can handle the common case of data packet decryption and
-    /// cookie verification while permitting multithreaded access to the tunnel.
+    /// cookie verification without needing to hold a write lock on the tunnel.
     pub fn try_decapsulate<'a>(
         &self,
         src_addr: Option<IpAddr>,
@@ -573,7 +580,7 @@ impl Tunn {
     }
 
     /// Push packet to the back of the queue
-    fn queue_packet(&mut self, packet: &[u8]) {
+    pub fn queue_packet(&mut self, packet: &[u8]) {
         if self.packet_queue.len() < MAX_QUEUE_DEPTH {
             // Drop if too many are already in queue
             self.packet_queue.push_back(packet.to_vec());

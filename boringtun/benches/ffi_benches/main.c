@@ -1,5 +1,3 @@
-
-
 #include <errno.h>
 #include <getopt.h>
 #include <limits.h>
@@ -225,7 +223,7 @@ int main(int argc, char* argv[]) {
     srand(time(0));
     set_logging_function(wg_print_msg);
 
-    // This thread should handle signals.
+    // The main thread should handle signals.
     struct sigaction action = {
         .sa_handler = handle_signal,
     };
