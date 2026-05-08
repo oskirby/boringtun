@@ -18,7 +18,7 @@ use std::collections::VecDeque;
 use std::convert::{TryFrom, TryInto};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use portable_atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// The default value to use for rate limiting, when no other rate limiter is defined

@@ -3,7 +3,7 @@
 
 use super::errors::WireGuardError;
 use crate::noise::{Tunn, TunnResult};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use portable_atomic::{AtomicBool, AtomicU64, Ordering};
 
 use std::time::Duration;
 
