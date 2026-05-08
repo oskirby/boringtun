@@ -110,8 +110,14 @@ impl Tunn {
             _ => {}
         }
 
-        let msecs = self.timers.current.as_millis() as u64;
-        self.timers.timers[timer_name as usize].store(msecs, Ordering::Release);
+        let index = timer_name as usize;
+        let current = self.timers.current.as_millis() as u64;
+        let mut prev = self.timers.timers[index].load(Ordering::Acquire);
+        while prev < current {
+            prev = self.timers.timers[index]
+                .compare_exchange_weak(prev, current, Ordering::SeqCst, Ordering::Acquire)
+                .unwrap_or_else(|x| x);
+        }
     }
 
     pub(super) fn timer_fetch(&self, timer_name: TimerName) -> Duration {
