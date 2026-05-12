@@ -20,6 +20,8 @@ static void wg_worker_sigmask() {
     sigemptyset(&sigset);
     sigaddset(&sigset, SIGHUP);
     pthread_sigmask(SIG_UNBLOCK, &sigset, NULL);
+
+    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
 }
 
 struct wg_bench_iphdr {
@@ -253,10 +255,9 @@ void wg_bench_fetch_stats(const struct wg_bench_client* client, struct wg_bench_
 void wg_bench_close(struct wg_bench_client* client) {
     // Signal that we are shutting down and terminate workers.
     atomic_store(&client->worker_shutdown, true);
-    client->worker_shutdown = 1;
-    pthread_kill(client->background, SIGHUP);
     pthread_join(client->background, NULL);
     for (int i = 0; i < client->worker_count; i++) {
+        pthread_cancel(client->workers[i]);
         pthread_join(client->workers[i], NULL);
     }
 

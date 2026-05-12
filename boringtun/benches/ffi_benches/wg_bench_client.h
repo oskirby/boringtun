@@ -24,11 +24,11 @@ struct wg_bench_client {
     struct wg_bench_client* peer;
 
     // The packet send and receive worker pool.
-    int       worker_handshake;
-    int       worker_shutdown;
-    int       worker_count;
-    pthread_t background;
-    pthread_t workers[WG_BENCH_MAX_THREADS];
+    int         worker_handshake;
+    atomic_bool worker_shutdown;
+    int         worker_count;
+    pthread_t   background;
+    pthread_t   workers[WG_BENCH_MAX_THREADS];
 
     // Statistics.
     struct wg_bench_statistics stats;

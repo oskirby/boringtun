@@ -64,10 +64,8 @@ static void handle_signal(int sig) {
 }
 
 static long timespec_cmp(const struct timespec *a, const struct timespec* b) {
-    if (long i = (a->tv_sec - b->tv_sec)) {
-        return i;
-    }
-    return (a->tv_nsec - b->tv_nsec);
+    long i = (a->tv_sec - b->tv_sec);
+    return i ? i : (a->tv_nsec - b->tv_nsec);
 }
 
 static double timespec_elapsed(const struct timespec *a, const struct timespec* b) {
