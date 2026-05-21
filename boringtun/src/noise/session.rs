@@ -3,7 +3,6 @@
 
 use super::PacketData;
 use crate::noise::errors::WireGuardError;
-use parking_lot::Mutex;
 use portable_atomic::{AtomicU64, Ordering};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 
@@ -13,7 +12,7 @@ pub struct Session {
     receiver: LessSafeKey,
     sender: LessSafeKey,
     sending_key_counter: AtomicU64,
-    receiving_key_counter: Mutex<ReceivingKeyCounterValidator>,
+    receiving_key_counter: ReceivingKeyCounterValidator,
 }
 
 impl std::fmt::Debug for Session {
@@ -33,61 +32,97 @@ const AEAD_SIZE: usize = 16;
 
 // Receiving buffer constants
 const WORD_SIZE: u64 = 64;
-const N_WORDS: u64 = 16; // Suffice to reorder 64*16 = 1024 packets; can be increased at will
-const N_BITS: u64 = WORD_SIZE * N_WORDS;
+const N_WORDS: usize = 16; // Suffice to reorder 64*16 = 1024 packets; can be increased at will
+const N_BITS: u64 = WORD_SIZE * N_WORDS as u64;
+// The most significant bit used as a flag to indicate that the bitmap is being updated,
+// and acts effectively as a spinlock.
+const COUNTER_LOCK: u64 = 1u64 << (WORD_SIZE - 1);
+const COUNTER_MASK: u64 = !COUNTER_LOCK;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 struct ReceivingKeyCounterValidator {
     /// In order to avoid replays while allowing for some reordering of the packets, we keep a
     /// bitmap of received packets, and the value of the highest counter
-    next: u64,
+    next: AtomicU64,
     /// Used to estimate packet loss
-    receive_cnt: u64,
-    bitmap: [u64; N_WORDS as usize],
+    receive_cnt: AtomicU64,
+    bitmap: [AtomicU64; N_WORDS as usize],
 }
 
 impl ReceivingKeyCounterValidator {
-    #[inline(always)]
-    fn set_bit(&mut self, idx: u64) {
-        let bit_idx = idx % N_BITS;
-        let word = (bit_idx / WORD_SIZE) as usize;
-        let bit = (bit_idx % WORD_SIZE) as usize;
-        self.bitmap[word] |= 1 << bit;
-    }
-
-    #[inline(always)]
-    fn clear_bit(&mut self, idx: u64) {
-        let bit_idx = idx % N_BITS;
-        let word = (bit_idx / WORD_SIZE) as usize;
-        let bit = (bit_idx % WORD_SIZE) as usize;
-        self.bitmap[word] &= !(1u64 << bit);
-    }
-
-    /// Clear the word that contains idx
-    #[inline(always)]
-    fn clear_word(&mut self, idx: u64) {
-        let bit_idx = idx % N_BITS;
-        let word = (bit_idx / WORD_SIZE) as usize;
-        self.bitmap[word] = 0;
-    }
-
     /// Returns true if bit is set, false otherwise
     #[inline(always)]
     fn check_bit(&self, idx: u64) -> bool {
         let bit_idx = idx % N_BITS;
         let word = (bit_idx / WORD_SIZE) as usize;
         let bit = (bit_idx % WORD_SIZE) as usize;
-        ((self.bitmap[word] >> bit) & 1) == 1
+        ((self.bitmap[word].load(Ordering::Acquire) >> bit) & 1) == 1
+    }
+
+    /// Mark the packet as received, release the spinlock and return the verdict.
+    #[inline(always)]
+    fn mark_and_unlock(&self, idx: u64) -> Result<(), WireGuardError> {
+        let bit_idx = idx % N_BITS;
+        let word = (bit_idx / WORD_SIZE) as usize;
+        let bit = (bit_idx % WORD_SIZE) as usize;
+        let previous = self.bitmap[word].fetch_or(1 << bit, Ordering::SeqCst);
+        self.next.fetch_and(COUNTER_MASK, Ordering::SeqCst);
+        if (previous >> bit) & 1 == 1 {
+            Err(WireGuardError::DuplicateCounter)
+        } else {
+            Ok(())
+        } 
+    }
+
+    /// Clear all the packets between prev and next.
+    #[inline(always)]
+    fn clear_range(&self, prev: u64, next: u64) {
+        if next <= prev {
+            return;
+        }
+
+        if next - prev >= N_BITS {
+            // Too far ahead, clear all the bits
+            for i in 0..N_WORDS {
+                self.bitmap[i].store(0, Ordering::SeqCst);
+            }
+            return;
+        }
+
+        let prev_idx = (prev / WORD_SIZE) as usize;
+        let prev_bit = 1u64 << (prev % WORD_SIZE);
+        let next_idx = (next / WORD_SIZE) as usize;
+        let next_bit = 1u64 << (next % WORD_SIZE);
+        if next_idx == prev_idx {
+            // The bits to clear all fit within a single word.
+            let mask = !(next_bit - prev_bit);
+            self.bitmap[prev_idx % N_WORDS].fetch_and(mask, Ordering::SeqCst);
+        } else {
+            // The bits to clear span multiple words.
+            let mut mask: u64 = prev_bit - 1;
+            for i in prev_idx..next_idx-1 {
+                self.bitmap[i % N_WORDS].fetch_and(mask, Ordering::SeqCst);
+                mask = 0;
+            }
+            self.bitmap[next_idx % N_WORDS].fetch_and(!(next_bit - 1), Ordering::SeqCst);
+        }
     }
 
     /// Returns true if the counter was not yet received, and is not too far back
+    /// This check is lock-free, but it can return a false positive in case a
+    /// race condition occurs.
     #[inline(always)]
     fn will_accept(&self, counter: u64) -> Result<(), WireGuardError> {
-        if counter >= self.next {
+        if counter >= COUNTER_MASK {
+            // Too many packets, counter would overflow.
+            return Err(WireGuardError::InvalidCounter);
+        }
+        let next = self.next.load(Ordering::Acquire) & COUNTER_MASK;
+        if counter >= next {
             // As long as the counter is growing no replay took place for sure
             return Ok(());
         }
-        if counter + N_BITS < self.next {
+        if counter + N_BITS < next {
             // Drop if too far back
             return Err(WireGuardError::InvalidCounter);
         }
@@ -101,52 +136,45 @@ impl ReceivingKeyCounterValidator {
     /// Marks the counter as received, and returns true if it is still good (in case during
     /// decryption something changed)
     #[inline(always)]
-    fn mark_did_receive(&mut self, counter: u64) -> Result<(), WireGuardError> {
-        if counter + N_BITS < self.next {
-            // Drop if too far back
+    fn mark_did_receive(&self, counter: u64) -> Result<(), WireGuardError> {
+        if counter >= COUNTER_MASK {
+            // Too many packets, counter would overflow.
             return Err(WireGuardError::InvalidCounter);
         }
-        if counter == self.next {
-            // Usually the packets arrive in order, in that case we simply mark the bit and
-            // increment the counter
-            self.set_bit(counter);
-            self.next += 1;
-            return Ok(());
-        }
-        if counter < self.next {
-            // A packet arrived out of order, check if it is valid, and mark
-            if self.check_bit(counter) {
+
+        let mut prev = self.next.load(Ordering::Acquire);
+        loop {
+            if (counter + N_BITS) < (prev & COUNTER_MASK) {
+                // Drop if too far back that the packet would fall outside the bitmask.
                 return Err(WireGuardError::InvalidCounter);
             }
-            self.set_bit(counter);
-            return Ok(());
-        }
-        // Packets where dropped, or maybe reordered, skip them and mark unused
-        if counter - self.next >= N_BITS {
-            // Too far ahead, clear all the bits
-            for c in self.bitmap.iter_mut() {
-                *c = 0;
+            if prev & COUNTER_LOCK == COUNTER_LOCK {
+                // Someone else has the spinlock. Try again.
+                prev = self.next.load(Ordering::Acquire);
+                continue;
             }
-        } else {
-            let mut i = self.next;
-            while i % WORD_SIZE != 0 && i < counter {
-                // Clear until i aligned to word size
-                self.clear_bit(i);
-                i += 1;
-            }
-            while i + WORD_SIZE < counter {
-                // Clear whole word at a time
-                self.clear_word(i);
-                i = (i + WORD_SIZE) & 0u64.wrapping_sub(WORD_SIZE);
-            }
-            while i < counter {
-                // Clear any remaining bits
-                self.clear_bit(i);
-                i += 1;
+            if counter < prev {
+                // This packet arrived out of order, just acquire the spinlock.
+                match self.next.compare_exchange_weak(prev, prev | COUNTER_LOCK, Ordering::SeqCst, Ordering::Relaxed) {
+                    Ok(_) => break,
+                    Err(x) => prev = x,
+                }
+            } else {
+                // This packet arrived in-order.
+                // Acquire the spinlock, update the next packet counter, and clear bits that wrapped over.
+                match self.next.compare_exchange_weak(prev, (counter+1) | COUNTER_LOCK, Ordering::SeqCst, Ordering::Relaxed) {
+                    Ok(_) => {
+                        self.clear_range(prev, counter);
+                        break;
+                    },
+                    Err(x) => prev = x,
+                }
             }
         }
-        self.set_bit(counter);
-        self.next = counter + 1;
+
+        // And finally try to mark the packet, release the spinlock, and return the verdict.
+        self.mark_and_unlock(counter)?;
+        self.receive_cnt.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -166,28 +194,12 @@ impl Session {
             ),
             sender: LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, &sending_key).unwrap()),
             sending_key_counter: AtomicU64::new(0),
-            receiving_key_counter: Mutex::new(Default::default()),
+            receiving_key_counter: Default::default(),
         }
     }
 
     pub(super) fn local_index(&self) -> usize {
         self.receiving_index as usize
-    }
-
-    /// Returns true if receiving counter is good to use
-    fn receiving_counter_quick_check(&self, counter: u64) -> Result<(), WireGuardError> {
-        let counter_validator = self.receiving_key_counter.lock();
-        counter_validator.will_accept(counter)
-    }
-
-    /// Returns true if receiving counter is good to use, and marks it as used {
-    fn receiving_counter_mark(&self, counter: u64) -> Result<(), WireGuardError> {
-        let mut counter_validator = self.receiving_key_counter.lock();
-        let ret = counter_validator.mark_did_receive(counter);
-        if ret.is_ok() {
-            counter_validator.receive_cnt += 1;
-        }
-        ret
     }
 
     /// src - an IP packet from the interface
@@ -247,7 +259,7 @@ impl Session {
             return Err(WireGuardError::WrongIndex);
         }
         // Don't reuse counters, in case this is a replay attack we want to quickly check the counter without running expensive decryption
-        self.receiving_counter_quick_check(packet.counter)?;
+        self.receiving_key_counter.will_accept(packet.counter)?;
 
         let ret = {
             let mut nonce = [0u8; 12];
@@ -263,14 +275,15 @@ impl Session {
         };
 
         // After decryption is done, check counter again, and mark as received
-        self.receiving_counter_mark(packet.counter)?;
+        self.receiving_key_counter.mark_did_receive(packet.counter)?;
         Ok(ret)
     }
 
     /// Returns the estimated downstream packet loss for this session
     pub(super) fn current_packet_cnt(&self) -> (u64, u64) {
-        let counter_validator = self.receiving_key_counter.lock();
-        (counter_validator.next, counter_validator.receive_cnt)
+        let next = self.receiving_key_counter.next.load(Ordering::Relaxed) & COUNTER_MASK;
+        let rx = self.receiving_key_counter.receive_cnt.load(Ordering::Relaxed);
+        (next, rx)
     }
 }
 
