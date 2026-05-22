@@ -5,6 +5,7 @@ use super::PacketData;
 use crate::noise::errors::WireGuardError;
 use portable_atomic::{AtomicU64, Ordering};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
+use std::hint;
 
 pub struct Session {
     pub(crate) receiving_index: u32,
@@ -30,13 +31,19 @@ const DATA_OFFSET: usize = 16;
 /// The overhead of the AEAD
 const AEAD_SIZE: usize = 16;
 
+#[cfg(target_has_atomic="64")]
+type CounterBitmap = AtomicU64;
+#[cfg(not(target_has_atomic="64"))]
+use portable_atomic::AtomicU32 as CounterBitmap;
+
 // Receiving buffer constants
-const WORD_SIZE: u64 = 64;
-const N_WORDS: usize = 16; // Suffice to reorder 64*16 = 1024 packets; can be increased at will
-const N_BITS: u64 = WORD_SIZE * N_WORDS as u64;
+const WORD_SIZE: u64 = if cfg!(target_has_atomic="64") { 64 } else { 32 };
+const N_BITS: u64 = 1024;
+const N_WORDS: usize = (N_BITS / WORD_SIZE) as usize;
+
 // The most significant bit used as a flag to indicate that the bitmap is being updated,
 // and acts effectively as a spinlock.
-const COUNTER_LOCK: u64 = 1u64 << (WORD_SIZE - 1);
+const COUNTER_LOCK: u64 = 1u64 << 63;
 const COUNTER_MASK: u64 = !COUNTER_LOCK;
 
 #[derive(Debug, Default)]
@@ -46,7 +53,7 @@ struct ReceivingKeyCounterValidator {
     next: AtomicU64,
     /// Used to estimate packet loss
     receive_cnt: AtomicU64,
-    bitmap: [AtomicU64; N_WORDS as usize],
+    bitmap: [ CounterBitmap; N_WORDS as usize],
 }
 
 impl ReceivingKeyCounterValidator {
@@ -54,8 +61,13 @@ impl ReceivingKeyCounterValidator {
         ReceivingKeyCounterValidator {
             next: AtomicU64::new(0),
             receive_cnt: AtomicU64::new(0),
-            bitmap: [ const { AtomicU64::new(0) }; N_WORDS as usize],
+            bitmap: [ const { CounterBitmap::new(0) }; N_WORDS],
         }
+    }
+
+    #[inline(always)]
+    fn get_next(&self) -> u64 {
+        self.next.load(Ordering::Acquire) & COUNTER_MASK
     }
 
     /// Returns true if bit is set, false otherwise
@@ -63,7 +75,7 @@ impl ReceivingKeyCounterValidator {
     fn check_bit(&self, idx: u64) -> bool {
         let bit_idx = idx % N_BITS;
         let word = (bit_idx / WORD_SIZE) as usize;
-        let bit = (bit_idx % WORD_SIZE) as usize;
+        let bit = bit_idx % WORD_SIZE;
         ((self.bitmap[word].load(Ordering::Acquire) >> bit) & 1) == 1
     }
 
@@ -72,7 +84,7 @@ impl ReceivingKeyCounterValidator {
     fn mark_and_unlock(&self, idx: u64) -> Result<(), WireGuardError> {
         let bit_idx = idx % N_BITS;
         let word = (bit_idx / WORD_SIZE) as usize;
-        let bit = (bit_idx % WORD_SIZE) as usize;
+        let bit = bit_idx % WORD_SIZE;
         let previous = self.bitmap[word].fetch_or(1 << bit, Ordering::SeqCst);
         self.next.fetch_and(COUNTER_MASK, Ordering::SeqCst);
         if (previous >> bit) & 1 == 1 {
@@ -97,11 +109,15 @@ impl ReceivingKeyCounterValidator {
             return;
         }
 
-        let prev_idx = (prev / WORD_SIZE) as usize;
-        let prev_mask = (1u64 << (prev % WORD_SIZE)) - 1;
+        #[cfg(target_has_atomic="64")]
+        const ONE: u64 = 1;
+        #[cfg(not(target_has_atomic="32"))]
+        const ONE: u32 = 1;
 
+        let prev_idx = (prev / WORD_SIZE) as usize;
+        let prev_mask = (ONE << (prev % WORD_SIZE)) - 1;
         let next_idx = (next / WORD_SIZE) as usize;
-        let next_mask = (u64::MAX - 1) << (next % WORD_SIZE);
+        let next_mask = (!ONE) << (next % WORD_SIZE);
 
         if next_idx == prev_idx {
             // The bits to clear all fit within a single word.
@@ -128,6 +144,7 @@ impl ReceivingKeyCounterValidator {
         let mut next = self.next.load(Ordering::SeqCst);
         while (next & COUNTER_LOCK) != 0 {
             next = self.next.load(Ordering::SeqCst);
+            hint::spin_loop();
         }
         if counter >= next {
             // As long as the counter is growing no replay took place for sure
@@ -162,9 +179,7 @@ impl ReceivingKeyCounterValidator {
             if prev & COUNTER_LOCK == COUNTER_LOCK {
                 // Someone else has the spinlock. Try again.
                 prev = self.next.load(Ordering::SeqCst);
-                continue;
-            }
-            if counter < prev {
+            } else if counter < prev {
                 // This packet arrived out of order, acquire the spinlock to mark the packet.
                 match self.next.compare_exchange_weak(prev, prev | COUNTER_LOCK, Ordering::SeqCst, Ordering::Acquire) {
                     Ok(_) => break,
@@ -181,6 +196,7 @@ impl ReceivingKeyCounterValidator {
                     Err(x) => prev = x,
                 }
             }
+            hint::spin_loop();
         }
 
         // And finally try to mark the packet, release the spinlock, and return the verdict.
@@ -292,9 +308,8 @@ impl Session {
 
     /// Returns the estimated downstream packet loss for this session
     pub(super) fn current_packet_cnt(&self) -> (u64, u64) {
-        let next = self.receiving_key_counter.next.load(Ordering::Relaxed) & COUNTER_MASK;
         let rx = self.receiving_key_counter.receive_cnt.load(Ordering::Relaxed);
-        (next, rx)
+        (self.receiving_key_counter.get_next(), rx)
     }
 }
 
@@ -416,19 +431,26 @@ mod tests {
                 break;
             }
 
-            // If we are spinning the CPU hard enough, it is possible to get
-            // invalid counters when threads stall long enough for their counter
-            // to grow too old for the bitmap.
             match validator.will_accept(value) {
                 Ok(_) => {},
-                Err(WireGuardError::InvalidCounter) => continue,
-                Err(WireGuardError::DuplicateCounter) => panic!("duplicate while marking {}", value),
-                _ => panic!("error while marking packet {}", value),
+                Err(WireGuardError::InvalidCounter) => {
+                    // This error is allowed if, and only if, the thread hit an
+                    // unlucky interrupt and the counter is too old now.
+                    assert!(validator.get_next() >= value + N_BITS);
+                    continue;
+                },
+                Err(WireGuardError::DuplicateCounter) => panic!("duplicate while checking {}", value),
+                _ => panic!("error while checking packet {}", value),
             };
 
             match validator.mark_did_receive(value) {
                 Ok(_) => {},
-                Err(WireGuardError::InvalidCounter) => continue,
+                Err(WireGuardError::InvalidCounter) => {
+                    // This error is allowed if, and only if, the thread hit an
+                    // unlucky interrupt and the counter is too old now.
+                    assert!(validator.get_next() >= value + N_BITS);
+                    continue;
+                },
                 Err(WireGuardError::DuplicateCounter) => panic!("duplicate while marking {}", value),
                 _ => panic!("error while marking {}", value),
             };
@@ -445,7 +467,7 @@ mod tests {
     #[cfg(test)]
     fn racecheck_dup_worker(counter: &AtomicU64, validator: &ReceivingKeyCounterValidator) {
         while counter.load(Ordering::Relaxed) < RACE_MAX_PACKETS {
-            let value = validator.next.load(Ordering::Relaxed) & COUNTER_MASK;
+            let value = validator.get_next();
             if value > 0 {
                 assert!(validator.mark_did_receive(value - 1).is_err());
             }
