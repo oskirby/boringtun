@@ -50,6 +50,14 @@ struct ReceivingKeyCounterValidator {
 }
 
 impl ReceivingKeyCounterValidator {
+    pub const fn new() -> ReceivingKeyCounterValidator {
+        ReceivingKeyCounterValidator {
+            next: AtomicU64::new(0),
+            receive_cnt: AtomicU64::new(0),
+            bitmap: [ const { AtomicU64::new(0) }; N_WORDS as usize],
+        }
+    }
+
     /// Returns true if bit is set, false otherwise
     #[inline(always)]
     fn check_bit(&self, idx: u64) -> bool {
@@ -77,7 +85,7 @@ impl ReceivingKeyCounterValidator {
     /// Clear all the packets between prev and next.
     #[inline(always)]
     fn clear_range(&self, prev: u64, next: u64) {
-        if next <= prev {
+        if next < prev {
             return;
         }
 
@@ -90,21 +98,21 @@ impl ReceivingKeyCounterValidator {
         }
 
         let prev_idx = (prev / WORD_SIZE) as usize;
-        let prev_bit = 1u64 << (prev % WORD_SIZE);
+        let prev_mask = (1u64 << (prev % WORD_SIZE)) - 1;
+
         let next_idx = (next / WORD_SIZE) as usize;
-        let next_bit = 1u64 << (next % WORD_SIZE);
+        let next_mask = (u64::MAX - 1) << (next % WORD_SIZE);
+
         if next_idx == prev_idx {
             // The bits to clear all fit within a single word.
-            let mask = !(next_bit - prev_bit);
-            self.bitmap[prev_idx % N_WORDS].fetch_and(mask, Ordering::SeqCst);
+            self.bitmap[prev_idx % N_WORDS].fetch_and(next_mask | prev_mask, Ordering::SeqCst);
         } else {
             // The bits to clear span multiple words.
-            let mut mask: u64 = prev_bit - 1;
-            for i in prev_idx..next_idx-1 {
-                self.bitmap[i % N_WORDS].fetch_and(mask, Ordering::SeqCst);
-                mask = 0;
+            self.bitmap[prev_idx % N_WORDS].fetch_and(prev_mask, Ordering::SeqCst);
+            for i in prev_idx+1..next_idx {
+                self.bitmap[i % N_WORDS].store(0, Ordering::SeqCst);
             }
-            self.bitmap[next_idx % N_WORDS].fetch_and(!(next_bit - 1), Ordering::SeqCst);
+            self.bitmap[next_idx % N_WORDS].fetch_and(next_mask, Ordering::SeqCst);
         }
     }
 
@@ -117,7 +125,10 @@ impl ReceivingKeyCounterValidator {
             // Too many packets, counter would overflow.
             return Err(WireGuardError::InvalidCounter);
         }
-        let next = self.next.load(Ordering::Acquire) & COUNTER_MASK;
+        let mut next = self.next.load(Ordering::SeqCst);
+        while (next & COUNTER_LOCK) != 0 {
+            next = self.next.load(Ordering::SeqCst);
+        }
         if counter >= next {
             // As long as the counter is growing no replay took place for sure
             return Ok(());
@@ -145,24 +156,24 @@ impl ReceivingKeyCounterValidator {
         let mut prev = self.next.load(Ordering::Acquire);
         loop {
             if (counter + N_BITS) < (prev & COUNTER_MASK) {
-                // Drop if too far back that the packet would fall outside the bitmask.
+                // Drop if too far back that the packet would fall outside the bitmap.
                 return Err(WireGuardError::InvalidCounter);
             }
             if prev & COUNTER_LOCK == COUNTER_LOCK {
                 // Someone else has the spinlock. Try again.
-                prev = self.next.load(Ordering::Acquire);
+                prev = self.next.load(Ordering::SeqCst);
                 continue;
             }
             if counter < prev {
-                // This packet arrived out of order, just acquire the spinlock.
-                match self.next.compare_exchange_weak(prev, prev | COUNTER_LOCK, Ordering::SeqCst, Ordering::Relaxed) {
+                // This packet arrived out of order, acquire the spinlock to mark the packet.
+                match self.next.compare_exchange_weak(prev, prev | COUNTER_LOCK, Ordering::SeqCst, Ordering::Acquire) {
                     Ok(_) => break,
                     Err(x) => prev = x,
                 }
             } else {
                 // This packet arrived in-order.
-                // Acquire the spinlock, update the next packet counter, and clear bits that wrapped over.
-                match self.next.compare_exchange_weak(prev, (counter+1) | COUNTER_LOCK, Ordering::SeqCst, Ordering::Relaxed) {
+                // Acquire the spinlock, update the next packet counter, and clear bits that will wrap over.
+                match self.next.compare_exchange_weak(prev, (counter+1) | COUNTER_LOCK, Ordering::SeqCst, Ordering::Acquire) {
                     Ok(_) => {
                         self.clear_range(prev, counter);
                         break;
@@ -288,11 +299,65 @@ impl Session {
 }
 
 #[cfg(test)]
+use std::thread;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(test)]
+    fn check_replay_clear_range(start: u64, end: u64) {
+        // Setup the replay bitmap with all bits set.
+        let c: ReceivingKeyCounterValidator = Default::default();
+        for i in 0..N_WORDS {
+            c.bitmap[i].store(!0, Ordering::Release);
+        }
+        c.next.store(N_BITS, Ordering::Release);
+        for i in 0..N_BITS {
+            assert!(c.check_bit(i));
+        }
+
+        // Clear a range, and recheck the bitmap.
+        c.clear_range(start, end);
+        let check_start = (start / WORD_SIZE) * WORD_SIZE;
+        for i in check_start..check_start+N_BITS {
+            if i < start || i > end {
+                assert!(c.check_bit(i), "expected bit {} to be set", i);
+            } else {
+                assert!(!c.check_bit(i), "expected bit {} to be clear", i);
+            }
+        }
+    }
+
+    #[test]
+    fn test_replay_clear_range() {
+        // Clear a single bit and check edge cases.
+        check_replay_clear_range(0, 0);
+        check_replay_clear_range(42, 42);
+        check_replay_clear_range(WORD_SIZE-1, WORD_SIZE-1);
+        check_replay_clear_range(WORD_SIZE, WORD_SIZE);
+        check_replay_clear_range(N_BITS-1, N_BITS-1);
+        check_replay_clear_range(N_BITS, N_BITS);
+
+        // Clear some bits in the middle of a single word.
+        check_replay_clear_range(13, 19);
+
+        // Clear precisely one word.
+        check_replay_clear_range(WORD_SIZE, WORD_SIZE * 2 - 1);
+
+        // Clear some bits spanning two words.
+        check_replay_clear_range(WORD_SIZE + 7, WORD_SIZE * 2 + 13);
+
+        // Clear some bits that span many words.
+        check_replay_clear_range(WORD_SIZE + 7, N_BITS - 7);
+
+        // Clear some bits that wrap around to the start of the index.
+        check_replay_clear_range(N_BITS - 7, N_BITS + 7);
+    }
+
     #[test]
     fn test_replay_counter() {
-        let mut c: ReceivingKeyCounterValidator = Default::default();
+        let c: ReceivingKeyCounterValidator = Default::default();
 
         assert!(c.mark_did_receive(0).is_ok());
         assert!(c.mark_did_receive(0).is_err());
@@ -304,8 +369,8 @@ mod tests {
         assert!(c.mark_did_receive(15).is_err());
 
         for i in 64..N_BITS + 128 {
-            assert!(c.mark_did_receive(i).is_ok());
-            assert!(c.mark_did_receive(i).is_err());
+            assert!(c.mark_did_receive(i).is_ok(), "unexpected mark failed for bit {}", i);
+            assert!(c.mark_did_receive(i).is_err(), "duplicate packet not caught for bit {}", i);
         }
 
         assert!(c.mark_did_receive(N_BITS * 3).is_ok());
@@ -338,5 +403,69 @@ mod tests {
         assert!(c.mark_did_receive(N_BITS * 3 + 70).is_err());
         assert!(c.mark_did_receive(N_BITS * 3 + 71).is_err());
         assert!(c.mark_did_receive(N_BITS * 3 + 72).is_err());
+    }
+
+    const RACE_MAX_PACKETS: u64 = 1024 * 1024;
+
+    // Race check worker to try and send valid packets, they should be accepted.
+    #[cfg(test)]
+    fn racecheck_counter_worker(counter: &AtomicU64, validator: &ReceivingKeyCounterValidator) {
+        loop {
+            let value = counter.fetch_add(1, Ordering::Relaxed);
+            if value > RACE_MAX_PACKETS {
+                break;
+            }
+
+            // If we are spinning the CPU hard enough, it is possible to get
+            // invalid counters when threads stall long enough for their counter
+            // to grow too old for the bitmap.
+            match validator.will_accept(value) {
+                Ok(_) => {},
+                Err(WireGuardError::InvalidCounter) => continue,
+                Err(WireGuardError::DuplicateCounter) => panic!("duplicate while marking {}", value),
+                _ => panic!("error while marking packet {}", value),
+            };
+
+            match validator.mark_did_receive(value) {
+                Ok(_) => {},
+                Err(WireGuardError::InvalidCounter) => continue,
+                Err(WireGuardError::DuplicateCounter) => panic!("duplicate while marking {}", value),
+                _ => panic!("error while marking {}", value),
+            };
+
+            // Resend it as a duplicate, it must be rejected.
+            assert!(validator.mark_did_receive(value).is_err(),
+                    "race encountered while checking duplicate {}", value);
+            
+            thread::yield_now();
+        }
+    }
+
+    // Race check worker to try and send duplicate packets, they must all be rejected.
+    #[cfg(test)]
+    fn racecheck_dup_worker(counter: &AtomicU64, validator: &ReceivingKeyCounterValidator) {
+        while counter.load(Ordering::Relaxed) < RACE_MAX_PACKETS {
+            let value = validator.next.load(Ordering::Relaxed) & COUNTER_MASK;
+            if value > 0 {
+                assert!(validator.mark_did_receive(value - 1).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn test_replay_racecheck() {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        static VALIDATOR: ReceivingKeyCounterValidator = ReceivingKeyCounterValidator::new();
+        let mut threads = Vec::new();
+        let num_threads = thread::available_parallelism().map_or(8, |x| x.get());
+
+        for _ in 0..num_threads-1 {
+            threads.push(thread::spawn(|| { racecheck_counter_worker(&COUNTER, &VALIDATOR) }));
+        }
+        threads.push(thread::spawn(|| { racecheck_dup_worker(&COUNTER, &VALIDATOR) }));
+
+        for handle in threads {
+            handle.join().unwrap();
+        }
     }
 }
