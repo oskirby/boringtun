@@ -53,7 +53,7 @@ struct ReceivingKeyCounterValidator {
     next: AtomicU64,
     /// Used to estimate packet loss
     receive_cnt: AtomicU64,
-    bitmap: [ CounterBitmap; N_WORDS as usize],
+    bitmap: [ CounterBitmap; N_WORDS],
 }
 
 impl ReceivingKeyCounterValidator {
@@ -67,7 +67,7 @@ impl ReceivingKeyCounterValidator {
 
     #[inline(always)]
     fn get_next(&self) -> u64 {
-        self.next.load(Ordering::Acquire) & COUNTER_MASK
+        self.next.load(Ordering::SeqCst) & COUNTER_MASK
     }
 
     /// Returns true if bit is set, false otherwise
@@ -76,7 +76,7 @@ impl ReceivingKeyCounterValidator {
         let bit_idx = idx % N_BITS;
         let word = (bit_idx / WORD_SIZE) as usize;
         let bit = bit_idx % WORD_SIZE;
-        ((self.bitmap[word].load(Ordering::Acquire) >> bit) & 1) == 1
+        ((self.bitmap[word].load(Ordering::SeqCst) >> bit) & 1) == 1
     }
 
     /// Mark the packet as received, release the spinlock and return the verdict.
@@ -111,7 +111,7 @@ impl ReceivingKeyCounterValidator {
 
         #[cfg(target_has_atomic="64")]
         const ONE: u64 = 1;
-        #[cfg(not(target_has_atomic="32"))]
+        #[cfg(not(target_has_atomic="64"))]
         const ONE: u32 = 1;
 
         let prev_idx = (prev / WORD_SIZE) as usize;
@@ -132,32 +132,43 @@ impl ReceivingKeyCounterValidator {
         }
     }
 
-    /// Returns true if the counter was not yet received, and is not too far back
-    /// This check is lock-free, but it can return a false positive in case a
-    /// race condition occurs.
+    /// Returns true if the counter was not yet received, and is not too far back.
     #[inline(always)]
     fn will_accept(&self, counter: u64) -> Result<(), WireGuardError> {
         if counter >= COUNTER_MASK {
             // Too many packets, counter would overflow.
             return Err(WireGuardError::InvalidCounter);
         }
+
+        // Spin while checking the counter until the bitmap is updated, as
+        // indicated by the COUNTER_LOCK bit being cleared.
         let mut next = self.next.load(Ordering::SeqCst);
-        while (next & COUNTER_LOCK) != 0 {
+        loop {
+            if counter >= (next & COUNTER_MASK) {
+                // As long as the counter is growing no replay took place for sure
+                return Ok(());
+            }
+            if counter + N_BITS < (next & COUNTER_MASK) {
+                // Drop if too far back
+                return Err(WireGuardError::InvalidCounter);
+            }
+            if (next & COUNTER_LOCK) == 0 {
+                break;
+            }
             next = self.next.load(Ordering::SeqCst);
             hint::spin_loop();
         }
-        if counter >= next {
-            // As long as the counter is growing no replay took place for sure
-            return Ok(());
-        }
-        if counter + N_BITS < next {
-            // Drop if too far back
-            return Err(WireGuardError::InvalidCounter);
-        }
-        if !self.check_bit(counter) {
-            Ok(())
-        } else {
+
+        // Check the bitmap for duplicates, then re-check the counter
+        // one last time in case a race conditioned occurred.
+        let duplicate = self.check_bit(counter);
+        let next = self.next.load(Ordering::SeqCst) & COUNTER_MASK;
+        return if counter + N_BITS < next {
+            Err(WireGuardError::InvalidCounter)
+        } else if duplicate {
             Err(WireGuardError::DuplicateCounter)
+        } else {
+            Ok(())
         }
     }
 
@@ -426,9 +437,17 @@ mod tests {
     #[cfg(test)]
     fn racecheck_counter_worker(counter: &AtomicU64, validator: &ReceivingKeyCounterValidator) {
         loop {
-            let value = counter.fetch_add(1, Ordering::Relaxed);
+            let mut value = counter.fetch_add(1, Ordering::Relaxed);
             if value > RACE_MAX_PACKETS {
                 break;
+            }
+
+            // To drive the out-of-order packet handling a little harder, simulate some packet
+            // reordering. If the packet is a multiple of 29, increment the value being sent by
+            // 29. This should still never generate a duplicate but forces the validator to
+            // interact with the bitmap to figure it out.
+            if value % 29 == 0 {
+                value += 29;
             }
 
             match validator.will_accept(value) {
