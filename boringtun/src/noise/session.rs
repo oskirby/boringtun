@@ -31,13 +31,17 @@ const DATA_OFFSET: usize = 16;
 /// The overhead of the AEAD
 const AEAD_SIZE: usize = 16;
 
-#[cfg(target_has_atomic="64")]
+#[cfg(target_has_atomic = "64")]
 type CounterBitmap = AtomicU64;
-#[cfg(not(target_has_atomic="64"))]
+#[cfg(not(target_has_atomic = "64"))]
 use portable_atomic::AtomicU32 as CounterBitmap;
 
 // Receiving buffer constants
-const WORD_SIZE: u64 = if cfg!(target_has_atomic="64") { 64 } else { 32 };
+const WORD_SIZE: u64 = if cfg!(target_has_atomic = "64") {
+    64
+} else {
+    32
+};
 const N_BITS: u64 = 1024;
 const N_WORDS: usize = (N_BITS / WORD_SIZE) as usize;
 
@@ -53,7 +57,7 @@ struct ReceivingKeyCounterValidator {
     next: AtomicU64,
     /// Used to estimate packet loss
     receive_cnt: AtomicU64,
-    bitmap: [ CounterBitmap; N_WORDS],
+    bitmap: [CounterBitmap; N_WORDS],
 }
 
 impl ReceivingKeyCounterValidator {
@@ -61,7 +65,7 @@ impl ReceivingKeyCounterValidator {
         ReceivingKeyCounterValidator {
             next: AtomicU64::new(0),
             receive_cnt: AtomicU64::new(0),
-            bitmap: [ const { CounterBitmap::new(0) }; N_WORDS],
+            bitmap: [const { CounterBitmap::new(0) }; N_WORDS],
         }
     }
 
@@ -91,7 +95,7 @@ impl ReceivingKeyCounterValidator {
             Err(WireGuardError::DuplicateCounter)
         } else {
             Ok(())
-        } 
+        }
     }
 
     /// Clear all the packets between prev and next.
@@ -109,9 +113,9 @@ impl ReceivingKeyCounterValidator {
             return;
         }
 
-        #[cfg(target_has_atomic="64")]
+        #[cfg(target_has_atomic = "64")]
         const ONE: u64 = 1;
-        #[cfg(not(target_has_atomic="64"))]
+        #[cfg(not(target_has_atomic = "64"))]
         const ONE: u32 = 1;
 
         let prev_idx = (prev / WORD_SIZE) as usize;
@@ -125,7 +129,7 @@ impl ReceivingKeyCounterValidator {
         } else {
             // The bits to clear span multiple words.
             self.bitmap[prev_idx % N_WORDS].fetch_and(prev_mask, Ordering::SeqCst);
-            for i in prev_idx+1..next_idx {
+            for i in prev_idx + 1..next_idx {
                 self.bitmap[i % N_WORDS].store(0, Ordering::SeqCst);
             }
             self.bitmap[next_idx % N_WORDS].fetch_and(next_mask, Ordering::SeqCst);
@@ -169,7 +173,7 @@ impl ReceivingKeyCounterValidator {
             Err(WireGuardError::DuplicateCounter)
         } else {
             Ok(())
-        }
+        };
     }
 
     /// Marks the counter as received, and returns true if it is still good (in case during
@@ -192,18 +196,28 @@ impl ReceivingKeyCounterValidator {
                 prev = self.next.load(Ordering::SeqCst);
             } else if counter < prev {
                 // This packet arrived out of order, acquire the spinlock to mark the packet.
-                match self.next.compare_exchange_weak(prev, prev | COUNTER_LOCK, Ordering::SeqCst, Ordering::Acquire) {
+                match self.next.compare_exchange_weak(
+                    prev,
+                    prev | COUNTER_LOCK,
+                    Ordering::SeqCst,
+                    Ordering::Acquire,
+                ) {
                     Ok(_) => break,
                     Err(x) => prev = x,
                 }
             } else {
                 // This packet arrived in-order.
                 // Acquire the spinlock, update the next packet counter, and clear bits that will wrap over.
-                match self.next.compare_exchange_weak(prev, (counter+1) | COUNTER_LOCK, Ordering::SeqCst, Ordering::Acquire) {
+                match self.next.compare_exchange_weak(
+                    prev,
+                    (counter + 1) | COUNTER_LOCK,
+                    Ordering::SeqCst,
+                    Ordering::Acquire,
+                ) {
                     Ok(_) => {
                         self.clear_range(prev, counter);
                         break;
-                    },
+                    }
                     Err(x) => prev = x,
                 }
             }
@@ -232,7 +246,7 @@ impl Session {
             ),
             sender: LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, &sending_key).unwrap()),
             sending_key_counter: AtomicU64::new(0),
-            receiving_key_counter: Default::default(),
+            receiving_key_counter: ReceivingKeyCounterValidator::new(),
         }
     }
 
@@ -313,13 +327,17 @@ impl Session {
         };
 
         // After decryption is done, check counter again, and mark as received
-        self.receiving_key_counter.mark_did_receive(packet.counter)?;
+        self.receiving_key_counter
+            .mark_did_receive(packet.counter)?;
         Ok(ret)
     }
 
     /// Returns the estimated downstream packet loss for this session
     pub(super) fn current_packet_cnt(&self) -> (u64, u64) {
-        let rx = self.receiving_key_counter.receive_cnt.load(Ordering::Relaxed);
+        let rx = self
+            .receiving_key_counter
+            .receive_cnt
+            .load(Ordering::Relaxed);
         (self.receiving_key_counter.get_next(), rx)
     }
 }
@@ -346,7 +364,7 @@ mod tests {
         // Clear a range, and recheck the bitmap.
         c.clear_range(start, end);
         let check_start = (start / WORD_SIZE) * WORD_SIZE;
-        for i in check_start..check_start+N_BITS {
+        for i in check_start..check_start + N_BITS {
             if i < start || i > end {
                 assert!(c.check_bit(i), "expected bit {} to be set", i);
             } else {
@@ -360,9 +378,9 @@ mod tests {
         // Clear a single bit and check edge cases.
         check_replay_clear_range(0, 0);
         check_replay_clear_range(42, 42);
-        check_replay_clear_range(WORD_SIZE-1, WORD_SIZE-1);
+        check_replay_clear_range(WORD_SIZE - 1, WORD_SIZE - 1);
         check_replay_clear_range(WORD_SIZE, WORD_SIZE);
-        check_replay_clear_range(N_BITS-1, N_BITS-1);
+        check_replay_clear_range(N_BITS - 1, N_BITS - 1);
         check_replay_clear_range(N_BITS, N_BITS);
 
         // Clear some bits in the middle of a single word.
@@ -395,8 +413,8 @@ mod tests {
         assert!(c.mark_did_receive(15).is_err());
 
         for i in 64..N_BITS + 128 {
-            assert!(c.mark_did_receive(i).is_ok(), "unexpected mark failed for bit {}", i);
-            assert!(c.mark_did_receive(i).is_err(), "duplicate packet not caught for bit {}", i);
+            assert!(c.mark_did_receive(i).is_ok());
+            assert!(c.mark_did_receive(i).is_err());
         }
 
         assert!(c.mark_did_receive(N_BITS * 3).is_ok());
@@ -451,33 +469,40 @@ mod tests {
             }
 
             match validator.will_accept(value) {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(WireGuardError::InvalidCounter) => {
                     // This error is allowed if, and only if, the thread hit an
                     // unlucky interrupt and the counter is too old now.
                     assert!(validator.get_next() >= value + N_BITS);
                     continue;
-                },
-                Err(WireGuardError::DuplicateCounter) => panic!("duplicate while checking {}", value),
+                }
+                Err(WireGuardError::DuplicateCounter) => {
+                    panic!("duplicate while checking {}", value)
+                }
                 _ => panic!("error while checking packet {}", value),
             };
 
             match validator.mark_did_receive(value) {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(WireGuardError::InvalidCounter) => {
                     // This error is allowed if, and only if, the thread hit an
                     // unlucky interrupt and the counter is too old now.
                     assert!(validator.get_next() >= value + N_BITS);
                     continue;
-                },
-                Err(WireGuardError::DuplicateCounter) => panic!("duplicate while marking {}", value),
+                }
+                Err(WireGuardError::DuplicateCounter) => {
+                    panic!("duplicate while marking {}", value)
+                }
                 _ => panic!("error while marking {}", value),
             };
 
             // Resend it as a duplicate, it must be rejected.
-            assert!(validator.mark_did_receive(value).is_err(),
-                    "race encountered while checking duplicate {}", value);
-            
+            assert!(
+                validator.mark_did_receive(value).is_err(),
+                "race encountered while checking duplicate {}",
+                value
+            );
+
             thread::yield_now();
         }
     }
@@ -500,10 +525,12 @@ mod tests {
         let mut threads = Vec::new();
         let num_threads = thread::available_parallelism().map_or(8, |x| x.get());
 
-        for _ in 0..num_threads-1 {
-            threads.push(thread::spawn(|| { racecheck_counter_worker(&COUNTER, &VALIDATOR) }));
+        for _ in 0..num_threads - 1 {
+            threads.push(thread::spawn(|| {
+                racecheck_counter_worker(&COUNTER, &VALIDATOR)
+            }));
         }
-        threads.push(thread::spawn(|| { racecheck_dup_worker(&COUNTER, &VALIDATOR) }));
+        threads.push(thread::spawn(|| racecheck_dup_worker(&COUNTER, &VALIDATOR)));
 
         for handle in threads {
             handle.join().unwrap();

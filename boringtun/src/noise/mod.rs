@@ -14,11 +14,11 @@ use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::timers::{TimerName, Timers};
 use crate::x25519;
 
+use portable_atomic::{AtomicUsize, Ordering};
 use std::collections::VecDeque;
 use std::convert::{TryFrom, TryInto};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
-use portable_atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// The default value to use for rate limiting, when no other rate limiter is defined
@@ -265,7 +265,7 @@ impl Tunn {
         // If there is no session, queue the packet for future retry
         self.queue_packet(src);
         // Initiate a new handshake if none is in progress
-        return self.format_handshake_initiation(dst, false);
+        self.format_handshake_initiation(dst, false)
     }
 
     /// Encapsulate a single packet from the tunnel interface.
@@ -343,18 +343,27 @@ impl Tunn {
     ) -> Option<TunnResult<'a>> {
         // Packet dequeue operations require a write lock.
         if datagram.is_empty() {
-            return if self.packet_queue.is_empty() { Some(TunnResult::Done) } else { None };
+            return if self.packet_queue.is_empty() {
+                Some(TunnResult::Done)
+            } else {
+                None
+            };
         }
 
         let mut cookie = [0u8; COOKIE_REPLY_SZ];
-        match self.rate_limiter.verify_packet(src_addr, datagram, &mut cookie) {
-            Ok(Packet::PacketData(p)) => Some(self.handle_data(p, dst).unwrap_or_else(TunnResult::from)),
+        match self
+            .rate_limiter
+            .verify_packet(src_addr, datagram, &mut cookie)
+        {
+            Ok(Packet::PacketData(p)) => {
+                Some(self.handle_data(p, dst).unwrap_or_else(TunnResult::from))
+            }
             Err(TunnResult::WriteToNetwork(cookie)) => {
                 dst[..cookie.len()].copy_from_slice(cookie);
                 return Some(TunnResult::WriteToNetwork(&mut dst[..cookie.len()]));
             }
             Err(TunnResult::Err(e)) => return Some(TunnResult::Err(e)),
-            _ => None
+            _ => None,
         }
     }
 
@@ -450,12 +459,17 @@ impl Tunn {
             // There is nothing to do, already using this session, this is the common case
             return;
         }
-        
+
         if self.sessions[cur_idx % N_SESSIONS].is_none()
             || self.timers.session_timers[new_idx % N_SESSIONS]
                 >= self.timers.session_timers[cur_idx % N_SESSIONS]
         {
-            if let Ok(idx) = self.current.compare_exchange(cur_idx, new_idx, Ordering::Acquire, Ordering::Relaxed) {
+            if let Ok(idx) = self.current.compare_exchange(
+                cur_idx,
+                new_idx,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
                 tracing::debug!(message = "New session", session = idx);
             }
         }

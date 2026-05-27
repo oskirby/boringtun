@@ -82,7 +82,16 @@ impl RateLimiter {
         let last_msec = self.last_reset.load(Ordering::Acquire);
         let last_reset = Duration::from_millis(last_msec);
         if now - last_reset >= RESET_PERIOD {
-            if self.last_reset.compare_exchange(last_msec, now.as_millis() as u64, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+            if self
+                .last_reset
+                .compare_exchange(
+                    last_msec,
+                    now.as_millis() as u64,
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
                 self.count.store(0, Ordering::SeqCst);
             }
         }
